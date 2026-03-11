@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# JetBrains IDEs (GoLand, IntelliJ IDEA, etc.)
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
