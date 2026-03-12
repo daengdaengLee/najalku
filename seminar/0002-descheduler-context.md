@@ -61,7 +61,7 @@
 - [x] 2. 전체 동작 흐름
 - [x] 3. Plugin 시스템
 - [x] 4. RemoveDuplicates
-- [ ] 5. RemovePodsViolatingTopologySpreadConstraint
+- [x] 5. RemovePodsViolatingTopologySpreadConstraint
 - [ ] 6. 정리 및 비교
 
 ---

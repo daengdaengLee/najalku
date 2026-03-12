@@ -435,3 +435,209 @@ func getTargetNodes(...) []*v1.Node {  // L236
 ```
 
 파드가 실제로 재배치될 수 없는 노드는 분모에서 제외되어 `upperAvg`가 더 정확하게 계산된다.
+
+## 5. [플러그인 2] RemovePodsViolatingTopologySpreadConstraint
+
+### 문제 정의
+
+Kubernetes의 `TopologySpreadConstraint(TSC)`는 파드를 토폴로지 도메인(예: 가용 영역, 노드)에 고르게 분산시키는 규칙이다. 이 규칙이 처음엔 만족되었더라도, 노드 추가/제거나 다른 eviction 이후 불균형이 생길 수 있다.
+
+```
+TopologySpreadConstraint:
+  topologyKey: topology.kubernetes.io/zone
+  maxSkew: 1
+
+초기 상태 (균형):
+  Zone A: [pod-1] [pod-2]   (2개)
+  Zone B: [pod-3] [pod-4]   (2개)
+
+→ Zone B의 노드가 다운되어 재스케줄링 발생
+
+현재 상태 (위반):
+  Zone A: [pod-1] [pod-2] [pod-3] [pod-4]   (4개)
+  Zone B: (없음)                              (0개)
+  skew = 4 - 0 = 4 > maxSkew(1) → TSC 위반
+```
+
+`RemovePodsViolatingTopologySpreadConstraint`는 이런 위반 상태를 감지하고 초과 도메인에서 파드를 evict해 재분배를 유도한다.
+
+### 핵심 용어 정리
+
+| 용어 | 정의 |
+|---|---|
+| **`TopologySpreadConstraint (TSC)`** | 파드 분산 규칙. `topologyKey`로 도메인을 나누고 `maxSkew`로 허용 불균형을 지정한다. |
+| **`topologyKey`** | 도메인 분류 기준이 되는 노드 레이블 키. 예: `"topology.kubernetes.io/zone"`. |
+| **`maxSkew`** | 가장 많은 도메인과 가장 적은 도메인의 파드 수 차이의 허용 최대값. |
+| **`topologyPair`** | `{key, value}` 쌍으로 하나의 토폴로지 도메인을 식별한다. 예: `{key: "zone", value: "us-east-1a"}`. |
+| **`topology`** | `topologyPair` + 해당 도메인에 속한 파드 목록. `balanceDomains()`에서 도메인 단위로 다룬다. |
+| **`constraintTopologies`** | 하나의 TSC에 대해 도메인별 파드 목록을 담는 맵. `topologyPair → []*v1.Pod`. |
+| **`sortedDomains`** | `constraintTopologies`를 파드 수 기준 오름차순으로 정렬한 `[]topology`. two-pointer 알고리즘의 입력이다. |
+| **`idealAvg`** | 이상적인 도메인당 평균 파드 수. `sumPods / len(constraintTopologies)`로 계산한다. |
+| **`podsForEviction`** | 모든 TSC 처리 결과를 모은 최종 evict 대상 파드 집합. 중복 eviction 방지를 위해 맵으로 관리한다. |
+
+### 알고리즘 개요
+
+```
+Phase 1 — TSC별 도메인 집계 (네임스페이스 × TSC 순회)
+  네임스페이스별로:
+    해당 네임스페이스의 파드에서 고유 TSC 목록 수집
+    TSC별로:
+      constraintTopologies 초기화 (topologyKey를 가진 모든 노드 포함, 빈 도메인도 포함)
+      각 파드를 알맞은 topologyPair에 할당해 파드 수 집계
+      이미 균형이면 skip → balanceDomains() 호출
+
+Phase 2 — two-pointer로 evict 대상 선정 (balanceDomains)
+  idealAvg = sumPods / 도메인 수
+  sortedDomains = 도메인을 파드 수 오름차순 정렬
+  i=0(가장 작은 도메인), j=끝(가장 큰 도메인)
+  while i < j:
+    j 도메인이 idealAvg 이하면 j-- (줄 수 있는 게 없음)
+    skew = sortedDomains[j].pods - sortedDomains[i].pods
+    skew ≤ maxSkew면 i++ (이 쌍은 허용 범위 내)
+    아니면 movePods 계산 후 j의 파드를 podsForEviction에 추가
+
+Phase 3 — podsForEviction 실제 evict
+```
+
+### Balance() 코드 따라가기
+
+> `pkg/framework/plugins/removepodsviolatingtopologyspreadconstraint/topologyspreadconstraint.go`
+
+#### Phase 1: TSC별 도메인 집계
+
+먼저 클러스터 전체 파드를 네임스페이스별로 묶는다. (`L138-L147`)
+
+```go
+pods, err := podutil.ListPodsOnNodes(nodes, ...)  // L138: 전체 노드의 파드 수집
+namespacedPods := podutil.GroupByNamespace(pods)   // L147: 네임스페이스별 그룹화
+```
+
+각 네임스페이스에서 고유한 TSC를 수집한다. (`L154-L176`)
+
+```go
+for _, pod := range namespacedPods[namespace] {  // L155
+    for _, constraint := range pod.Spec.TopologySpreadConstraints {
+        if !allowedConstraints.Has(constraint.WhenUnsatisfiable) { continue }
+        // 이미 수집한 것과 동일한 TSC면 skip (중복 제거)
+        if hasIdenticalConstraints(...) { continue }  // L171
+        namespaceTopologySpreadConstraints = append(..., tsc)
+    }
+}
+```
+
+TSC마다 `constraintTopologies`를 초기화할 때, **파드가 0개인 도메인도 미리 등록**한다. (`L183-L192`)
+
+```go
+// L186-L192: 해당 topologyKey 레이블을 가진 모든 노드를 빈 슬라이스로 초기화
+for _, node := range nodeMap {
+    if val, ok := node.Labels[tsc.TopologyKey]; ok {
+        constraintTopologies[topologyPair{key: tsc.TopologyKey, value: val}] = make([]*v1.Pod, 0)
+    }
+}
+```
+
+빈 도메인을 미리 넣는 이유: `idealAvg` 계산 시 파드가 없는 도메인도 분모에 포함해야 올바른 평균이 나오기 때문이다.
+
+이후 각 파드를 해당 topologyPair에 할당한다. (`L197-L222`)
+
+```go
+for _, pod := range namespacedPods[namespace] {  // L197
+    if !tsc.Selector.Matches(labels.Set(pod.Labels)) { continue }  // L203: 레이블 셀렉터 불일치 skip
+    nodeValue := node.Labels[tsc.TopologyKey]
+    topoPair := topologyPair{key: tsc.TopologyKey, value: nodeValue}  // L218
+    constraintTopologies[topoPair] = append(..., pod)  // L220
+    sumPods++
+}
+```
+
+이미 균형이면 `balanceDomains()` 호출을 건너뛴다. (`L223`)
+
+```go
+if topologyIsBalanced(constraintTopologies, tsc) { continue }  // L223
+d.balanceDomains(ctx, podsForEviction, tsc, constraintTopologies, sumPods, nodes)  // L227
+```
+
+#### Phase 2: balanceDomains() — two-pointer
+
+모든 TSC 처리가 끝나면 `podsForEviction`을 실제로 evict한다. 이 집합을 채우는 핵심 로직이 `balanceDomains()`다.
+
+```go
+func (d *...) balanceDomains(...) {  // L308
+    idealAvg := sumPods / float64(len(constraintTopologies))  // L309
+    sortedDomains := sortDomains(constraintTopologies, ...)   // L311: 파드 수 오름차순 정렬
+    ...
+    i := 0                        // L320: 가장 작은 도메인 포인터
+    j := len(sortedDomains) - 1   // L321: 가장 큰 도메인 포인터
+```
+
+`sortDomains()`는 도메인을 파드 수 오름차순으로 정렬하고, 각 도메인 안의 파드도 eviction 우선순위(낮은 우선순위, 셀렉터 없는 파드 먼저)로 정렬한다. 즉, 슬라이스 **뒤쪽**이 우선 evict 대상이다.
+
+two-pointer 루프: (`L322-L386`)
+
+```go
+for i < j {  // L322
+    // j 도메인이 idealAvg 이하면 더 줄 수 없음 → j를 당김
+    if float64(len(sortedDomains[j].pods)) <= idealAvg {  // L324
+        j--; continue
+    }
+
+    skew := float64(len(sortedDomains[j].pods) - len(sortedDomains[i].pods))  // L329
+
+    // skew가 maxSkew 이내면 이 쌍은 허용 범위 → i를 올림
+    if int32(skew) <= tsc.MaxSkew {  // L332
+        i++; continue
+    }
+
+    // 이동할 파드 수 계산 (세 가지 제약 중 최솟값)
+    aboveAvg  := math.Ceil(float64(len(sortedDomains[j].pods)) - idealAvg)  // L343: j가 평균 초과분
+    belowAvg  := math.Ceil(idealAvg - float64(len(sortedDomains[i].pods)))  // L344: i가 평균 미달분
+    halfSkew  := math.Ceil((skew - float64(tsc.MaxSkew)) / 2)               // L346: skew 절반
+    movePods  := int(math.Min(math.Min(aboveAvg, belowAvg), halfSkew))      // L347
+
+    if movePods <= 0 { i++; continue }  // L348
+
+    // j의 뒤쪽 movePods개를 podsForEviction에 추가  (L362-L383)
+    aboveToEvict := sortedDomains[j].pods[len(sortedDomains[j].pods)-movePods:]
+    for k := range aboveToEvict {
+        podsForEviction[aboveToEvict[k]] = struct{}{}  // L382
+    }
+    // 도메인 파드 수 갱신 (알고리즘 진행용 추적)
+    sortedDomains[j].pods = sortedDomains[j].pods[:len(sortedDomains[j].pods)-movePods]  // L384
+    sortedDomains[i].pods = append(sortedDomains[i].pods, aboveToEvict...)               // L385
+}
+```
+
+예시 (`maxSkew=1`, 도메인 6개):
+
+```
+초기 정렬: [2, 3, 5, 5, 7, 8]  idealAvg = 30/6 = 5
+
+i=0(2), j=5(8): skew=6 > 1, aboveAvg=3, belowAvg=3, halfSkew=3 → movePods=3
+  [5, 3, 5, 5, 7, 5]
+
+i=0(5), j=5(5): j ≤ idealAvg → j--
+i=0(5), j=4(7): skew=2 > 1, aboveAvg=2, belowAvg=0 → movePods=0 → i++
+
+i=1(3), j=4(7): skew=4 > 1, aboveAvg=2, belowAvg=2, halfSkew=2 → movePods=2
+  [5, 5, 5, 5, 5, 5]
+
+i=1(5), j=4(5): j ≤ idealAvg → j-- ... i >= j → 종료
+```
+
+#### Phase 3: 실제 eviction
+
+`podsForEviction`에 모인 파드를 순회하며 evict한다. (`L231-L254`)
+
+```go
+for pod := range podsForEviction {  // L232
+    if nodeLimitExceeded[pod.Spec.NodeName] { continue }  // L233: 노드 한도 초과 시 skip
+    if !d.podFilter(pod) { continue }                     // L236: Filter 재확인
+
+    if d.handle.Evictor().PreEvictionFilter(pod) {        // L240: 최종 확인 (NodeFit 등)
+        err := d.handle.Evictor().Evict(ctx, pod, ...)    // L241
+        ...
+    }
+}
+```
+
+`RemoveDuplicates`와 달리, TSC 플러그인은 eviction을 두 단계로 분리한다. `balanceDomains()`에서는 **후보만 선정**하고, 실제 eviction은 모든 TSC 처리가 끝난 뒤 한꺼번에 수행한다. 이렇게 하면 여러 TSC가 동일한 파드를 두 번 evict하는 것을 방지할 수 있다.
