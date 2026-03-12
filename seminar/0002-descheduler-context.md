@@ -60,7 +60,7 @@
 - [x] 1. 왜 Descheduler가 필요한가?
 - [x] 2. 전체 동작 흐름
 - [x] 3. Plugin 시스템
-- [ ] 4. RemoveDuplicates
+- [x] 4. RemoveDuplicates
 - [ ] 5. RemovePodsViolatingTopologySpreadConstraint
 - [ ] 6. 정리 및 비교
 

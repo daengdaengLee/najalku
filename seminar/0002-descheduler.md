@@ -264,3 +264,174 @@ RemoveDuplicates (BalancePlugin)
        └─ PreEvictionFilter (고비용)    → 최종 확정된 파드에만 실행
             └─ Kubernetes Eviction API
 ```
+
+## 4. [플러그인 1] RemoveDuplicates
+
+### 문제 정의
+
+같은 ReplicaSet이나 Deployment에 속한 파드들이 특정 노드에 몰려 있는 상황을 해결한다.
+
+```
+ReplicaSet "web" (파드 4개)
+
+  Node A:  [web-1] [web-2] [web-3]   ← 3개 몰림
+  Node B:  [web-4]
+  Node C:  (없음)
+```
+
+kube-scheduler가 처음 배치할 당시엔 최적이었더라도, 이후 노드가 추가되거나 다른 파드가 evict되면서 불균형이 생길 수 있다. `RemoveDuplicates`는 이런 상태를 감지하고 초과분을 evict해 재스케줄링을 유도한다.
+
+### 핵심 용어 정리
+
+코드에 등장하는 용어를 먼저 잡고 가자.
+
+| 용어 | 정의 |
+|---|---|
+| **`podOwner`** | 파드의 "소유자 + 이미지" 조합을 담는 구조체. `namespace`, `kind`, `name`, `imagesHash` 4개 필드로 구성된다. |
+| **`ownerKey`** | `podOwner` 구조체 값 자체를 맵의 키로 사용할 때의 명칭. "이 파드는 어떤 owner 그룹에 속하는가"를 식별하는 단위다. |
+| **`imagesHash`** | 파드의 컨테이너 이미지 목록을 정렬 후 `"#"`으로 연결한 문자열. 예: `"nginx:1.25#sidecar:v2"`. 같은 owner라도 이미지가 다르면 다른 그룹으로 취급한다. |
+| **`podContainerKeys`** | 파드 하나를 `"namespace/kind/name/image"` 형태의 문자열 목록으로 표현한 것 (정렬됨). 이 목록이 같은 파드 두 개가 한 노드에 있으면 **중복**으로 판단한다. |
+| **`duplicateKeysMap`** | 노드 안에서 중복을 탐지하는 임시 맵. 노드마다 초기화되므로 **같은 노드 내** 중복 탐지에만 쓰인다. |
+| **`ownerKeyOccurence`** | ownerKey별 전체 파드 수. **모든 노드**를 합산한 값으로, `upperAvg` 계산에 사용된다. |
+| **`duplicatePods`** | `ownerKey → 노드이름 → []*v1.Pod` 구조. 각 노드에서 중복으로 판별된 파드 목록. 각 노드의 **첫 번째 파드(기준 파드)는 포함되지 않는다.** |
+| **`upperAvg`** | 균등 분배 시 노드당 허용할 최대 파드 수. `ceil(전체 파드 수 / targetNode 수)` 로 계산한다. |
+| **`targetNodes`** | 파드가 실제로 스케줄 가능한 노드 목록. toleration, nodeSelector, nodeAffinity를 기준으로 필터링한다. |
+
+### 알고리즘 개요
+
+```
+Phase 1 — 중복 탐지 (노드별 순회)
+  각 노드의 파드를 순회하며:
+    podContainerKeys 생성 (namespace/kind/name/image 조합, 정렬)
+    같은 노드에 동일한 podContainerKeys를 가진 파드가 이미 있으면
+      → duplicatePods[ownerKey][nodeName] 에 추가
+    ownerKeyOccurence[ownerKey] 증가 (모든 파드 카운트)
+
+Phase 2 — 초과분 evict (ownerKey별)
+  ownerKey마다:
+    targetNodes 계산 (실제 스케줄 가능한 노드들)
+    upperAvg = ceil(전체 파드 수 / targetNode 수)
+    각 노드에서 (중복 수 + 1) > upperAvg 이면 초과분 evict
+    ※ +1 의 이유는 아래 코드 따라가기에서 설명
+```
+
+### Balance() 코드 따라가기
+
+> `pkg/framework/plugins/removeduplicates/removeduplicates.go`
+
+#### Phase 1: 중복 탐지
+
+노드를 순회하면서 각 파드의 `ownerKey`와 `podContainerKeys`를 만든다. (`L110-L162`)
+
+```go
+// L132: duplicateKeysMap 은 노드마다 초기화 → 같은 노드 내 중복 탐지에만 사용
+duplicateKeysMap := map[string][][]string{}
+
+for _, pod := range pods {  // L133
+    ownerRefList := podutil.OwnerRef(pod)
+    if len(ownerRefList) == 0 || hasExcludedOwnerRefKind(...) {
+        continue  // L136: OwnerRef 없는 bare pod, 또는 제외 대상 kind는 스킵
+    }
+
+    // L144-L145: 이미지 목록 정렬 → "#"으로 연결 → imagesHash
+    sort.Strings(imageList)
+    imagesHash := strings.Join(imageList, "#")
+
+    for _, ownerRef := range ownerRefList {  // L146
+        // L147-L152: ownerKey 생성 (namespace + kind + name + imagesHash)
+        ownerKey := podOwner{namespace, kind: ownerRef.Kind, name: ownerRef.Name, imagesHash}
+        ownerKeyOccurence[ownerKey]++  // L153: 전체 파드 수 누적 (Phase 2 upperAvg 계산에 사용)
+
+        // L158-L159: "namespace/kind/name/image" 문자열 생성
+        s := strings.Join([]string{namespace, kind, name, image}, "/")
+        podContainerKeys = append(podContainerKeys, s)
+    }
+    sort.Strings(podContainerKeys)  // L162: 정렬해야 이후 DeepEqual 비교가 가능
+    ...
+}
+```
+
+`podContainerKeys`가 준비되면, 같은 노드에서 이미 같은 키를 봤는지 `duplicateKeysMap`으로 확인한다. (`L165-L193`)
+
+```go
+if existing, ok := duplicateKeysMap[podContainerKeys[0]]; ok {  // L165
+    for _, keys := range existing {
+        if reflect.DeepEqual(keys, podContainerKeys) {  // L168: 전체 키 목록 비교
+            // 중복 발견 → duplicatePods 에 추가
+            // 기준 파드(처음 본 파드)는 이미 넣지 않았으므로 여기서만 추가됨
+            duplicatePods[ownerKey][node.Name] = append(..., pod)  // L181
+            break
+        }
+    }
+} else {
+    // L192: 이 노드에서 처음 보는 키 → 기준 파드로 등록 (duplicatePods에는 추가하지 않음)
+    duplicateKeysMap[podContainerKeys[0]] = [][]string{podContainerKeys}
+}
+```
+
+`duplicateKeysMap`은 노드마다 초기화된다. 따라서 **한 노드 안에서 같은 ownerKey를 가진 파드가 2개 이상 있는 경우**만 `duplicatePods`에 기록된다. 노드 간 파드 수 불균형은 Phase 2의 `upperAvg`로 처리한다.
+
+#### Phase 2: upperAvg 계산과 eviction
+
+```go
+for ownerKey, podNodes := range duplicatePods {  // L198
+    targetNodes := getTargetNodes(ctx, podNodes, nodes)  // L200
+
+    if len(targetNodes) < 2 {  // L203
+        continue  // 갈 수 있는 노드가 1개 이하면 spread 불가 → 스킵
+    }
+
+    // L208: 균등 분배 시 노드당 최대 파드 수 (올림)
+    upperAvg := int(math.Ceil(float64(ownerKeyOccurence[ownerKey]) / float64(len(targetNodes))))
+
+    for nodeName, pods := range podNodes {  // L210
+        // L212 주석: "list of duplicated pods does not contain the original referential pod"
+        // pods = 중복 파드들 (기준 파드 제외)
+        // 실제 이 노드의 파드 수 = len(pods) + 1  ← 기준 파드를 더해야 실제 수
+        if len(pods)+1 > upperAvg {  // L213
+            for _, pod := range pods[upperAvg-1:] {  // L216: upperAvg-1개는 남기고 나머지 evict
+                r.handle.Evictor().Evict(ctx, pod, ...)  // L217
+            }
+        }
+    }
+}
+```
+
+예를 들어 `ownerKey`가 같은 파드가 4개이고 `targetNodes`가 3개라면:
+
+```
+ownerKeyOccurence[ownerKey] = 4
+len(targetNodes) = 3
+upperAvg = ceil(4 / 3) = 2
+
+Node A: 기준 파드 1개 + 중복 파드 2개  → len(pods)+1 = 3 > 2  → pods[1:] = 1개 evict
+Node B: 기준 파드 1개 + 중복 파드 0개  → duplicatePods에 없음  → 유지
+Node C: (없음)                          → duplicatePods에 없음  → 유지
+```
+
+evict된 파드는 kube-scheduler에 의해 Node C에 재배치된다.
+
+#### getTargetNodes — 실제로 갈 수 있는 노드만 계산
+
+> `L236-L291`
+
+`upperAvg`를 계산할 때 단순히 전체 노드 수를 쓰면 안 된다. 파드의 toleration, nodeSelector, nodeAffinity 때문에 일부 노드엔 스케줄이 불가능할 수 있기 때문이다.
+
+```go
+func getTargetNodes(...) []*v1.Node {  // L236
+    // L244-L261: toleration, nodeSelector, nodeAffinity 가 동일한 파드는 중복 제거 (효율화)
+    distinctPods := ...
+
+    // L265-L283: 각 파드가 스케줄 가능한 노드만 수집
+    for pod := range distinctPods {
+        for _, node := range nodes {
+            if !TolerationsTolerateTaints(...)  { continue }  // L268
+            if !PodMatchNodeSelector(...)        { continue }  // L273
+            targetNodesMap[node.Name] = node
+        }
+    }
+    return targetNodes
+}
+```
+
+파드가 실제로 재배치될 수 없는 노드는 분모에서 제외되어 `upperAvg`가 더 정확하게 계산된다.
