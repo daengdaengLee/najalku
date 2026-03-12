@@ -718,3 +718,19 @@ Descheduler는 `--dry-run` 플래그를 지원한다. 실제 eviction 없이 어
 #### Deployment 모드의 interval 설정
 
 interval이 너무 짧으면 이전 eviction으로 인한 재스케줄링이 완료되기 전에 다음 루프가 돌아 불필요한 eviction이 반복될 수 있다. 클러스터 규모와 kube-scheduler의 처리 속도를 고려해 충분한 interval을 설정해야 한다.
+
+---
+
+## 부록: 주요 코드 경로
+
+| 항목 | 경로 |
+|---|---|
+| 진입점 | `cmd/descheduler/descheduler.go` |
+| 서버 초기화 | `cmd/descheduler/app/server.go` |
+| 핵심 루프 | `pkg/descheduler/descheduler.go` |
+| 플러그인 인터페이스 | `pkg/framework/types/types.go` |
+| Profile 초기화 | `pkg/framework/profile/profile.go` |
+| DefaultEvictor | `pkg/framework/plugins/defaultevictor/defaultevictor.go` |
+| Eviction 처리 | `pkg/descheduler/evictions/evictions.go` |
+| RemoveDuplicates | `pkg/framework/plugins/removeduplicates/removeduplicates.go` |
+| TSC 플러그인 | `pkg/framework/plugins/removepodsviolatingtopologyspreadconstraint/topologyspreadconstraint.go` |
