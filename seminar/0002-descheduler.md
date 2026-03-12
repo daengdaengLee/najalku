@@ -213,6 +213,7 @@ type Handle interface {
     GetPodsAssignedToNodeFunc() ...           // 노드별 파드 목록 조회 (캐시)
     SharedInformerFactory() informers.SharedInformerFactory // 인포머 캐시
     MetricsCollector() *MetricsCollector      // CPU/메모리 사용량 수집
+    // 외 PrometheusClient(), PluginInstanceID() 등
 }
 ```
 
@@ -590,7 +591,14 @@ func (d *...) balanceDomains(...) {  // L308
     j := len(sortedDomains) - 1   // L321: 가장 큰 도메인 포인터
 ```
 
-`sortDomains()`는 도메인을 파드 수 오름차순으로 정렬하고, 각 도메인 안의 파드도 eviction 우선순위(낮은 우선순위, 셀렉터 없는 파드 먼저)로 정렬한다. 즉, 슬라이스 **뒤쪽**이 우선 evict 대상이다.
+`sortDomains()`는 도메인을 파드 수 오름차순으로 정렬하고, 각 도메인 안의 파드도 eviction 우선순위 순으로 정렬한다. 슬라이스 **뒤쪽**이 우선 evict 대상이며, 뒤쪽부터 순서는 다음과 같다.
+
+```
+← 보호 (앞)                                         evict 우선 (뒤) →
+  non-evictable | 셀렉터/affinity 있음 낮은→높은 우선순위 | 셀렉터/affinity 없음 낮은→높은 우선순위
+```
+
+즉, **셀렉터/affinity가 없고 우선순위가 높은 파드**가 가장 먼저 evict 대상이 된다.
 
 two-pointer 루프: (`L322-L386`)
 
