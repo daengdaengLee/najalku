@@ -62,7 +62,7 @@
 - [x] 3. Plugin 시스템
 - [x] 4. RemoveDuplicates
 - [x] 5. RemovePodsViolatingTopologySpreadConstraint
-- [ ] 6. 정리 및 비교
+- [x] 6. 정리 및 비교
 
 ---
 

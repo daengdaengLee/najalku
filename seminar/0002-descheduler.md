@@ -641,3 +641,80 @@ for pod := range podsForEviction {  // L232
 ```
 
 `RemoveDuplicates`와 달리, TSC 플러그인은 eviction을 두 단계로 분리한다. `balanceDomains()`에서는 **후보만 선정**하고, 실제 eviction은 모든 TSC 처리가 끝난 뒤 한꺼번에 수행한다. 이렇게 하면 여러 TSC가 동일한 파드를 두 번 evict하는 것을 방지할 수 있다.
+
+## 6. 정리 및 비교
+
+### 두 플러그인 비교
+
+두 플러그인 모두 `BalancePlugin`을 구현하지만, 감지하는 문제와 해결 방식이 다르다.
+
+#### 문제 정의
+
+| | RemoveDuplicates | RemovePodsViolatingTopologySpreadConstraint |
+|---|---|---|
+| **감지 대상** | 같은 owner의 파드가 한 노드에 2개 이상 몰린 경우 | TSC의 maxSkew를 초과한 도메인 간 불균형 |
+| **범위** | 노드 단위 | 토폴로지 도메인 단위 (zone, region 등) |
+| **트리거 조건** | 명시적 규칙 없이 소유자 기준 자동 감지 | 파드에 TSC가 명시되어 있어야 동작 |
+
+#### 감지 방식
+
+| | RemoveDuplicates | RemovePodsViolatingTopologySpreadConstraint |
+|---|---|---|
+| **집계 단위** | 노드별 `podContainerKeys` 비교 | 네임스페이스별 TSC 수집 → 도메인별 파드 수 집계 |
+| **빈 버킷 처리** | `duplicatePods`에 기록 없음 (Phase 2에서 처리) | `constraintTopologies` 초기화 시 빈 도메인도 미리 등록 |
+| **기준 계산** | `upperAvg = ceil(전체 파드 수 / targetNode 수)` | `idealAvg = 전체 파드 수 / 도메인 수` |
+
+#### 알고리즘
+
+| | RemoveDuplicates | RemovePodsViolatingTopologySpreadConstraint |
+|---|---|---|
+| **핵심 알고리즘** | 단순 임계값 비교 (`len(pods)+1 > upperAvg`) | two-pointer on sorted domains |
+| **eviction 시점** | 초과분 발견 즉시 evict | 모든 TSC 처리 후 `podsForEviction` 한꺼번에 evict |
+| **즉시 evict 이유** | ownerKey별 독립 처리, 중복 eviction 위험 없음 | 여러 TSC가 동일 파드를 중복 선정할 수 있어 일괄 처리 필요 |
+
+#### 시각적 비교
+
+```
+RemoveDuplicates
+  노드 A: [web-1] [web-2] [web-3]   → web-3 evict (노드 내 초과)
+  노드 B: [web-4]
+  노드 C: (없음)                    → web-3 재배치 예상
+
+RemovePodsViolatingTopologySpreadConstraint
+  Zone A: [pod-1] [pod-2] [pod-3] [pod-4]   → pod-3, pod-4 evict 후보
+  Zone B: (없음)                             → evict된 파드 재배치 예상
+  (maxSkew=1 기준, two-pointer로 이동할 수 최소화)
+```
+
+### Descheduler 운영 시 주의사항
+
+#### eviction은 재스케줄링을 보장하지 않는다
+
+Descheduler는 파드를 evict할 뿐, 어디로 재배치될지는 kube-scheduler가 결정한다. evict 후 동일한 노드로 돌아올 수도 있다. 특히 `NodeFit` 옵션이 꺼져 있으면 갈 곳 없는 파드도 evict된다.
+
+```
+권장: DefaultEvictor의 NodeFit 옵션 활성화
+→ PreEvictionFilter 단계에서 다른 노드에 스케줄 가능한지 확인 후 evict
+```
+
+#### PDB 설정 필수
+
+PodDisruptionBudget(PDB)이 없으면 Descheduler가 동시에 너무 많은 파드를 evict해 서비스 중단이 발생할 수 있다. `PodEvictor`는 eviction 전 PDB를 확인하므로, 중요한 워크로드에는 반드시 PDB를 설정해야 한다.
+
+#### eviction 한도 설정
+
+Policy에서 3가지 한도를 조합해 과도한 eviction을 방지한다.
+
+```yaml
+maxNoOfPodsToEvictPerNode: 5        # 노드당 한 루프에 최대 eviction 수
+maxNoOfPodsToEvictPerNamespace: 10  # 네임스페이스당 한 루프에 최대 eviction 수
+maxNoOfPodsToEvictTotal: 50         # 전체 한 루프에 최대 eviction 수
+```
+
+#### 실행 전 dry-run 확인
+
+Descheduler는 `--dry-run` 플래그를 지원한다. 실제 eviction 없이 어떤 파드가 evict 대상이 되는지 로그로 확인할 수 있다. 운영 환경 적용 전에 반드시 dry-run을 먼저 실행하자.
+
+#### Deployment 모드의 interval 설정
+
+interval이 너무 짧으면 이전 eviction으로 인한 재스케줄링이 완료되기 전에 다음 루프가 돌아 불필요한 eviction이 반복될 수 있다. 클러스터 규모와 kube-scheduler의 처리 속도를 고려해 충분한 interval을 설정해야 한다.
