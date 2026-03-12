@@ -1,4 +1,24 @@
 # Descheduler: Kubernetes 파드 재배치 전략
+## kube-scheduler가 놓친 자리를 채우는 법 — 플러그인 아키텍처로 배우는 파드 재배치 전략
+
+> **대주제:** k8s 클러스터 운영
+> **중주제:** Descheduler
+> **발표 시간:** 약 15~20분
+
+---
+
+## 목차
+
+1. 왜 Descheduler가 필요한가?
+2. 전체 동작 흐름
+3. Plugin 시스템
+4. [플러그인 1] RemoveDuplicates
+5. [플러그인 2] RemovePodsViolatingTopologySpreadConstraint
+6. 정리 및 비교
+7. 마무리
+- 부록: 주요 코드 경로
+
+---
 
 ## 1. 왜 Descheduler가 필요한가?
 
@@ -718,6 +738,46 @@ Descheduler는 `--dry-run` 플래그를 지원한다. 실제 eviction 없이 어
 #### Deployment 모드의 interval 설정
 
 interval이 너무 짧으면 이전 eviction으로 인한 재스케줄링이 완료되기 전에 다음 루프가 돌아 불필요한 eviction이 반복될 수 있다. 클러스터 규모와 kube-scheduler의 처리 속도를 고려해 충분한 interval을 설정해야 한다.
+
+---
+
+## 7. 마무리
+
+### Descheduler가 없었다면?
+
+```
+kube-scheduler가 최초 배치한 직후 (균형):
+  Node A: [web-1] [web-2]
+  Node B: [web-3] [web-4]
+  Node C: [web-5] [web-6]
+
+        ↓ 시간이 지나며 노드 추가, 파드 eviction 반복
+
+Descheduler 없이:
+  Node A: [web-1] [web-2] [web-3] [web-4]   ← 쏠림 고착
+  Node B: [web-5]
+  Node C: [web-6]
+  Node D: (빈 노드)
+
+Descheduler 있을 때:
+  → RemoveDuplicates가 Node A의 초과 파드를 evict
+  → kube-scheduler가 Node D에 재배치
+  Node A: [web-1] [web-2]
+  Node B: [web-3] [web-5]
+  Node C: [web-6]
+  Node D: [web-4]   ← 균형 회복
+```
+
+### 핵심 takeaway
+
+| 구성 요소 | 역할 | 핵심 메커니즘 |
+|---|---|---|
+| `RemoveDuplicates` | 같은 owner의 파드가 특정 노드에 몰린 경우 해소 | `upperAvg` 기준 초과분 즉시 evict |
+| `RemovePodsViolatingTopologySpreadConstraint` | TSC `maxSkew` 위반 상태 해소 | two-pointer로 최소 이동 evict 후보 선정 |
+| `DefaultEvictor` | evict 부작용 방지 | NodeFit · PDB 확인 후 최종 승인 |
+| **Descheduler 전체** | kube-scheduler의 일회성 배치 결정을 주기적으로 재검토 | 매 루프마다 플러그인을 실행해 최적 상태 유지 |
+
+> **kube-scheduler는 "지금 최선"을 고른다. Descheduler는 "지금도 최선인지"를 주기적으로 되묻는다.**
 
 ---
 
