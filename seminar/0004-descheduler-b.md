@@ -192,6 +192,8 @@ if topologyIsBalanced(constraintTopologies, tsc) { continue }  // L223
 d.balanceDomains(ctx, podsForEviction, tsc, constraintTopologies, sumPods, nodes)  // L227
 ```
 
+`topologyIsBalanced()`는 모든 도메인 쌍의 파드 수 차이가 maxSkew 이하이면 이미 균형 상태로 판단합니다.
+
 #### Phase 2: balanceDomains() — two-pointer
 
 `balanceDomains()`는 `podsForEviction` 집합을 채우는 핵심 로직입니다. 실제 eviction은 모든 TSC 처리가 끝난 뒤 Phase 3에서 한꺼번에 수행합니다.
@@ -209,8 +211,9 @@ func (d *...) balanceDomains(...) {  // L308
 같습니다.
 
 ```
-← 보호 (앞)                                         evict 우선 (뒤) →
-  non-evictable | 셀렉터/affinity 있음 낮은→높은 우선순위 | 셀렉터/affinity 없음 낮은→높은 우선순위
+슬라이스 인덱스: [0]                                                      → [N-1]
+                ← 보호 (eviction 시 보존)                    evict 우선 (뒤에서부터 꺼냄) →
+  non-evictable | 셀렉터/affinity 있음 (낮은 → 높은 우선순위) | 셀렉터/affinity 없음 (낮은 → 높은 우선순위)
 ```
 
 즉, **셀렉터/affinity가 없고 우선순위가 높은 파드**가 가장 먼저 evict 대상이 됩니다.
@@ -241,6 +244,7 @@ for i < j {  // L322
     movePods := int(math.Min(math.Min(aboveAvg, belowAvg), halfSkew)) // L347
 
     if movePods <= 0 { i++; continue }  // L348
+    // belowAvg=0(i 도메인이 이미 평균 이상)이면 movePods=0이 되어 i를 다음 도메인으로 옮깁니다.
     // halfSkew: 한 쌍에서 과도하게 evict하는 것을 막는 제약.
     // i 도메인은 다른 iteration에서 j 역할의 도메인으로부터도 채워질 수 있으므로,
     // 현재 j에서 skew를 단독으로 0까지 줄이려 하면 전체적으로 과잉 eviction이 발생한다.
@@ -276,6 +280,8 @@ i=1(5), j=4(5): j ≤ idealAvg → j-- ... i >= j → 종료
 ```
 
 #### Phase 3: 실제 eviction
+
+> `Balance()` 안에서 `balanceDomains()` 호출 직후에 이어지는 코드입니다. `balanceDomains()`는 별도 함수로 뒤에 정의(L308)되어 있어, Phase 3의 라인 번호(L231-L254)가 Phase 2(L308-L386)보다 앞섭니다.
 
 `podsForEviction`에 모인 파드를 순회하며 evict합니다. (`L231-L254`)
 
@@ -322,7 +328,7 @@ for pod := range podsForEviction {  // L232
 |-----------------|--------------------------------------|---------------------------------------------|
 | **핵심 알고리즘**     | 단순 임계값 비교 (`len(pods)+1 > upperAvg`) | two-pointer on sorted domains               |
 | **eviction 시점** | 초과분 발견 즉시 evict                      | 모든 TSC 처리 후 `podsForEviction` 한꺼번에 evict    |
-| **즉시 evict 이유** | ownerKey별 독립 처리, 중복 eviction 위험 없음   | 여러 TSC가 동일 파드를 중복 선정할 수 있어 일괄 처리 필요         |
+| **eviction 전략 이유** | ownerKey별 독립 처리, 중복 eviction 위험 없음   | 여러 TSC가 동일 파드를 중복 선정할 수 있어 일괄 처리 필요         |
 
 #### 시각적 비교
 
