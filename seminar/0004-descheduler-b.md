@@ -46,20 +46,22 @@ Policy (설정 파일)
 ### Handle → Evictor → DefaultEvictor 연결
 
 * 플러그인은 `Handle`을 통해서만 클러스터에 접근
-* `handle.Evictor()`가 돌려주는 `evictorImpl`은 초기화 시 `DefaultEvictor`의 Filter 함수들을 등록 -> 플러그인이 eviction을 요청할 때 자동으로
-  DefaultEvictor의 판별 로직이 실행
+* `handle.Evictor()`가 돌려주는 `evictorImpl`은 `Filter`, `PreEvictionFilter`, `Evict` 세 가지 메서드를 제공
+* 플러그인이 직접 순서대로 호출해야 하며, `Evict()`는 자동으로 필터링하지 않음 (`// no pre-check performed`)
 
 ```
 DefaultEvictor (EvictorPlugin)
     ↓ 초기화 시 Filter / PreEvictionFilter 함수 등록
 evictorImpl (Evictor)              ← handle.Evictor()가 리턴하는 실제 값
-    ↓ Evict() 호출 시
-PodEvictor                         ← 한도 체크 후 실제 Kubernetes Eviction API 호출
+    ├─ Filter(pod) bool
+    ├─ PreEvictionFilter(pod) bool
+    └─ Evict(pod)  → PodEvictor   ← 한도 체크 후 실제 Kubernetes Eviction API 호출
 ```
 
-* evict 대상 판별은 두 단계로 나뉨
-    * `Filter`(저비용, 후보 선정)로 먼저 좁힌 뒤
-    * `PreEvictionFilter`(고비용, 최종 확인 — 대표적으로 NodeFit)를 통과한 파드만 실제 evict
+* 플러그인이 세 단계를 명시적으로 호출
+    1. `Filter`(저비용, 후보 선정) — false면 skip
+    2. `PreEvictionFilter`(고비용, 최종 확인 — 대표적으로 NodeFit) — false면 skip
+    3. `Evict` — 한도 체크 후 실제 eviction
 
 ### RemoveDuplicates
 
@@ -69,13 +71,13 @@ PodEvictor                         ← 한도 체크 후 실제 Kubernetes Evict
 
 ## 2. RemovePodsViolatingTopologySpreadConstraint
 
-`RemovePodsViolatingTopologySpreadConstraint`는 `RemoveDuplicates`와 마찬가지로 `BalancePlugin`을 구현합니다. 클러스터 전체의 파드 분포를 보고 재분배가
-필요한 파드를 evict합니다.
+* `RemoveDuplicates`와 마찬가지로 `BalancePlugin` 구현체
+* 클러스터 전체의 파드 분포를 보고 재분배가 필요한 파드를 evict
 
 ### 문제 정의
 
-Kubernetes의 `TopologySpreadConstraint(TSC)`는 파드를 토폴로지 도메인(예: 가용 영역, 노드)에 고르게 분산시키는 규칙입니다. 이 규칙이 처음엔 만족되었더라도, 노드 추가/제거나
-다른 eviction 이후 불균형이 생길 수 있습니다.
+* `TopologySpreadConstraint(TSC)` — 파드를 토폴로지 도메인(예: 가용 영역, 노드)에 고르게 분산시키는 규칙
+* 규칙이 처음엔 만족되었더라도, 노드 다운 / 다른 eviction 이후 불균형이 생길 수 있음
 
 ```
 TopologySpreadConstraint:
@@ -86,7 +88,7 @@ TopologySpreadConstraint:
   Zone A: [pod-1] [pod-2]   (2개)
   Zone B: [pod-3] [pod-4]   (2개)
 
-→ Zone B의 노드가 다운되어 재스케줄링 발생
+→ Zone B의 노드가 다운되어 재스케줄링 발생 (node 객체는 클러스터에 잔존)
 
 현재 상태 (위반):
   Zone A: [pod-1] [pod-2] [pod-3] [pod-4]   (4개)
@@ -94,21 +96,21 @@ TopologySpreadConstraint:
   skew = 4 - 0 = 4 > maxSkew(1) → TSC 위반
 ```
 
-`RemovePodsViolatingTopologySpreadConstraint`는 이런 위반 상태를 감지하고 초과 도메인에서 파드를 evict해 재분배를 유도합니다.
+* TSC 플러그인이 위반 상태를 감지하고 초과 도메인에서 파드를 evict해 재분배를 유도
 
 ### 핵심 용어 정리
 
-| 용어                                   | 정의                                                                                    |
-|--------------------------------------|---------------------------------------------------------------------------------------|
-| **`TopologySpreadConstraint (TSC)`** | 파드 분산 규칙. `topologyKey`로 도메인을 나누고 `maxSkew`로 허용 불균형을 지정합니다.                           |
-| **`topologyKey`**                    | 도메인 분류 기준이 되는 노드 레이블 키. 예: `"topology.kubernetes.io/zone"`.                           |
-| **`maxSkew`**                        | 각 도메인의 파드 수와 전역 최솟값 사이의 허용 최대 차이. 예: maxSkew=1이면 어떤 도메인도 가장 적은 도메인보다 2개 이상 많을 수 없습니다. |
-| **`topologyPair`**                   | `{key, value}` 쌍으로 하나의 토폴로지 도메인을 식별합니다. 예: `{key: "zone", value: "us-east-1a"}`.      |
-| **`topology`**                       | `topologyPair` + 해당 도메인에 속한 파드 목록. `balanceDomains()`에서 도메인 단위로 다룹니다.                 |
-| **`constraintTopologies`**           | 하나의 TSC에 대해 도메인별 파드 목록을 담는 맵. `topologyPair → []*v1.Pod`.                             |
-| **`sortedDomains`**                  | `constraintTopologies`를 파드 수 기준 오름차순으로 정렬한 `[]topology`. two-pointer 알고리즘의 입력입니다.     |
-| **`idealAvg`**                       | 이상적인 도메인당 평균 파드 수. `sumPods / len(constraintTopologies)`로 계산합니다.                      |
-| **`podsForEviction`**                | 모든 TSC 처리 결과를 모은 최종 evict 대상 파드 집합. 중복 eviction 방지를 위해 맵으로 관리합니다.                     |
+| 용어                                   | 정의                                                                          |
+|--------------------------------------|-----------------------------------------------------------------------------|
+| **`TopologySpreadConstraint (TSC)`** | 파드 분산 규칙 — `topologyKey`로 도메인을 나누고 `maxSkew`로 허용 불균형을 지정                   |
+| **`topologyKey`**                    | 도메인 분류 기준 노드 레이블 키. 예: `"topology.kubernetes.io/zone"`                     |
+| **`maxSkew`**                        | 도메인 파드 수와 전역 최솟값의 허용 최대 차이. maxSkew=1이면 최소 도메인보다 2개 이상 많을 수 없음            |
+| **`topologyPair`**                   | `{key, value}` 쌍으로 도메인을 식별. 예: `{key: "zone", value: "us-east-1a"}`       |
+| **`topology`**                       | `topologyPair` + 해당 도메인의 파드 목록 — `balanceDomains()`의 처리 단위                  |
+| **`constraintTopologies`**           | TSC 하나에 대한 도메인별 파드 맵. `topologyPair → []*v1.Pod`                           |
+| **`sortedDomains`**                  | `constraintTopologies`를 파드 수 오름차순 정렬한 `[]topology` — two-pointer의 입력       |
+| **`idealAvg`**                       | 도메인당 이상적인 평균 파드 수. `sumPods / len(constraintTopologies)`                   |
+| **`podsForEviction`**                | 모든 TSC 처리 결과를 모은 evict 대상 집합 — 중복 eviction 방지를 위해 맵으로 관리                   |
 
 ### 알고리즘 개요
 
@@ -138,29 +140,45 @@ Phase 3 — podsForEviction 실제 evict
 
 > `pkg/framework/plugins/removepodsviolatingtopologyspreadconstraint/topologyspreadconstraint.go`
 
+```
+for namespace in namespaces:                        ← 네임스페이스 순회
+    namespaceTopologySpreadConstraints 수집 (중복 제거)
+
+    for tsc in namespaceTopologySpreadConstraints:  ← TSC 순회
+        constraintTopologies 초기화 (빈 도메인 등록)
+        각 파드를 topologyPair에 할당
+        if 균형: continue
+        balanceDomains(tsc, constraintTopologies)   ← Phase 2
+```
+
 #### Phase 1: TSC별 도메인 집계
 
-먼저 클러스터 전체 파드를 네임스페이스별로 묶습니다. (`L138-L147`)
+* 클러스터 전체 파드를 네임스페이스별로 그룹화 (`L138-L147`)
 
 ```go
 pods, err := podutil.ListPodsOnNodes(nodes, ...)  // L138: 전체 노드의 파드 수집
 namespacedPods := podutil.GroupByNamespace(pods)   // L147: 네임스페이스별 그룹화
 ```
 
-각 네임스페이스에서 고유한 TSC를 수집합니다. (`L154-L176`)
+* 각 네임스페이스에서 고유 TSC 수집 (`L154-L176`)
 
 ```go
 for _, pod := range namespacedPods[namespace] {  // L155
     for _, constraint := range pod.Spec.TopologySpreadConstraints {
         if !allowedConstraints.Has(constraint.WhenUnsatisfiable) { continue }
-        // 이미 수집한 것과 동일한 TSC면 skip (중복 제거)
-        if hasIdenticalConstraints(...) { continue }  // L171
+
+        // constraint(k8s API 타입)를 내부 타입으로 변환 — selector 파싱 등 포함
+        tsc, _ := newTopologySpreadConstraint(constraint, pod)  // L162
+
+        // 이미 수집된 슬라이스에 동일한 TSC가 있으면 skip
+        // 포인터 필드 때문에 == 비교 불가 → deepEqual 사용
+        if hasIdenticalConstraints(tsc, namespaceTopologySpreadConstraints) { continue }  // L171
         namespaceTopologySpreadConstraints = append(..., tsc)
     }
 }
 ```
 
-TSC마다 `constraintTopologies`를 초기화할 때, **파드가 0개인 도메인도 미리 등록**합니다. (`L183-L192`)
+* TSC마다 `constraintTopologies` 초기화 — **파드가 0개인 도메인도 미리 등록** (`L183-L192`)
 
 ```go
 // L186-L192: 해당 topologyKey 레이블을 가진 모든 노드를 빈 슬라이스로 초기화
@@ -171,32 +189,39 @@ for _, node := range nodeMap {
 }
 ```
 
-빈 도메인을 미리 넣는 이유: `idealAvg` 계산 시 파드가 없는 도메인도 분모에 포함해야 올바른 평균이 나오기 때문입니다.
-
-이후 각 파드를 해당 topologyPair에 할당합니다. (`L197-L222`)
+* 같은 zone에 노드가 여러 개 있으면 같은 키로 덮어씌워지지만, 빈 슬라이스 초기화라 문제없음
+* 빈 도메인을 미리 넣는 이유: `idealAvg` 계산 시 파드 없는 도메인도 분모에 포함해야 올바른 평균이 나옴
+* 각 파드를 해당 topologyPair에 할당 (`L197-L222`)
 
 ```go
 for _, pod := range namespacedPods[namespace] {  // L197
     if !tsc.Selector.Matches(labels.Set(pod.Labels)) { continue }  // L203: 레이블 셀렉터 불일치 skip
-    nodeValue := node.Labels[tsc.TopologyKey]
+
+    node, ok := nodeMap[pod.Spec.NodeName]  // L208: 파드가 올라가 있는 노드를 nodeMap에서 조회
+    if !ok { continue }                     // 아직 스케줄 안 된 파드면 skip
+
+    nodeValue, ok := node.Labels[tsc.TopologyKey]  // L213: 노드의 topologyKey 레이블 값 조회
+    if !ok { continue }                            // 해당 레이블 없는 노드면 skip
+
     topoPair := topologyPair{key: tsc.TopologyKey, value: nodeValue}  // L218
     constraintTopologies[topoPair] = append(..., pod)  // L220
     sumPods++
 }
 ```
 
-이미 균형이면 `balanceDomains()` 호출을 건너뜁니다. (`L223`)
+* 이미 균형이면 `balanceDomains()` 호출을 건너뜀 (`L223`)
 
 ```go
 if topologyIsBalanced(constraintTopologies, tsc) { continue }  // L223
 d.balanceDomains(ctx, podsForEviction, tsc, constraintTopologies, sumPods, nodes)  // L227
 ```
 
-`topologyIsBalanced()`는 모든 도메인 쌍의 파드 수 차이가 maxSkew 이하이면 이미 균형 상태로 판단합니다.
+* `topologyIsBalanced()` — 모든 도메인 쌍의 파드 수 차이가 maxSkew 이하이면 균형으로 판단
 
 #### Phase 2: balanceDomains() — two-pointer
 
-`balanceDomains()`는 `podsForEviction` 집합을 채우는 핵심 로직입니다. 실제 eviction은 모든 TSC 처리가 끝난 뒤 Phase 3에서 한꺼번에 수행합니다.
+* `balanceDomains()` — `podsForEviction` 집합을 채우는 핵심 로직
+* 실제 eviction은 모든 TSC 처리 후 Phase 3에서 한꺼번에 수행
 
 ```go
 func (d *...) balanceDomains(...) {  // L308
@@ -207,8 +232,8 @@ func (d *...) balanceDomains(...) {  // L308
     j := len(sortedDomains) - 1 // L321: 가장 큰 도메인 포인터
 ```
 
-`sortDomains()`는 도메인을 파드 수 오름차순으로 정렬하고, 각 도메인 안의 파드도 eviction 우선순위 순으로 정렬합니다. 슬라이스 **뒤쪽**이 우선 evict 대상이며, 뒤쪽부터 순서는 다음과
-같습니다.
+* `sortDomains()` — 도메인을 파드 수 오름차순 정렬, 도메인 내 파드도 eviction 우선순위 순 정렬
+* 슬라이스 **뒤쪽**이 우선 evict 대상 — 뒤쪽부터 순서:
 
 ```
 슬라이스 인덱스: [0]                                                      → [N-1]
@@ -216,10 +241,10 @@ func (d *...) balanceDomains(...) {  // L308
   non-evictable | 셀렉터/affinity 있음 (낮은 → 높은 우선순위) | 셀렉터/affinity 없음 (낮은 → 높은 우선순위)
 ```
 
-즉, **셀렉터/affinity가 없고 우선순위가 높은 파드**가 가장 먼저 evict 대상이 됩니다.
+* 결과: **셀렉터/affinity가 없고 우선순위가 높은 파드**가 가장 먼저 evict 대상
 
-> **참고**: 소스 코드의 주석(L419, L464)은 "낮은 우선순위를 먼저 evict"하겠다는 의도를 기술하고 있습니다. 그러나 실제 구현에서 `!comparePodsByPriority`는 낮은 우선순위를
-> 슬라이스 앞쪽에, 높은 우선순위를 뒤쪽에 배치합니다. eviction이 뒤쪽부터 가져가므로 결과적으로 **높은 우선순위가 먼저 evict**됩니다. 코드 주석과 구현이 불일치하는 사례입니다.
+> **참고**: 소스 코드 주석(L419, L464)은 "낮은 우선순위를 먼저 evict"하겠다는 의도를 기술. 그러나 실제 구현에서 `!comparePodsByPriority`는 낮은 우선순위를
+> 슬라이스 앞쪽에, 높은 우선순위를 뒤쪽에 배치. eviction이 뒤쪽부터 가져가므로 결과적으로 **높은 우선순위가 먼저 evict**됨. 코드 주석과 구현이 불일치하는 사례.
 
 two-pointer 루프: (`L322-L386`)
 
@@ -238,13 +263,15 @@ for i < j {  // L322
     }
 
     // 이동할 파드 수 계산 (세 가지 제약 중 최솟값)
-    aboveAvg := math.Ceil(float64(len(sortedDomains[j].pods)) - idealAvg) // L343: j가 평균 초과분
-    belowAvg := math.Ceil(idealAvg - float64(len(sortedDomains[i].pods))) // L344: i가 평균 미달분
-    halfSkew := math.Ceil((skew - float64(tsc.MaxSkew)) / 2) // L346: skew 허용 초과분의 절반
+    aboveAvg := math.Ceil(float64(len(sortedDomains[j].pods)) - idealAvg) // L343: j의 평균 초과분
+    belowAvg := math.Ceil(idealAvg - float64(len(sortedDomains[i].pods))) // L344: i의 평균 미달분
+    halfSkew := math.Ceil((skew - float64(tsc.MaxSkew)) / 2) // L346: 이 쌍의 skew를 maxSkew까지 줄이는 데 필요한 정확한 이동량
+    // 파드 1개 이동 시 j는 -1, i는 +1 → skew가 2 감소
+    // 따라서 (skew - maxSkew) / 2 개를 옮기면 skew가 정확히 maxSkew가 됨
     movePods := int(math.Min(math.Min(aboveAvg, belowAvg), halfSkew)) // L347
 
     if movePods <= 0 { i++; continue }  // L348
-    // belowAvg=0(i 도메인이 이미 평균 이상)이면 movePods=0이 되어 i를 다음 도메인으로 옮깁니다.
+    // belowAvg=0(i 도메인이 이미 평균 이상)이면 movePods=0이 되어 i를 다음 도메인으로 이동
     // halfSkew: 한 쌍에서 과도하게 evict하는 것을 막는 제약.
     // i 도메인은 다른 iteration에서 j 역할의 도메인으로부터도 채워질 수 있으므로,
     // 현재 j에서 skew를 단독으로 0까지 줄이려 하면 전체적으로 과잉 eviction이 발생한다.
@@ -262,7 +289,7 @@ for i < j {  // L322
 
 예시 (`maxSkew=1`, 도메인 6개):
 
-> **참고**: 파드 수가 바뀌어도 배열을 재정렬하지 않습니다. 괄호 안 숫자는 해당 인덱스의 현재 파드 수입니다.
+> **참고**: 파드 수가 바뀌어도 배열을 재정렬하지 않음. 괄호 안 숫자는 해당 인덱스의 현재 파드 수.
 
 ```
 초기 정렬: [2, 3, 5, 5, 7, 8]  idealAvg = 30/6 = 5
@@ -281,9 +308,9 @@ i=1(5), j=4(5): j ≤ idealAvg → j-- ... i >= j → 종료
 
 #### Phase 3: 실제 eviction
 
-> `Balance()` 안에서 `balanceDomains()` 호출 직후에 이어지는 코드입니다. `balanceDomains()`는 별도 함수로 뒤에 정의(L308)되어 있어, Phase 3의 라인 번호(L231-L254)가 Phase 2(L308-L386)보다 앞섭니다.
+> `Balance()` 안에서 `balanceDomains()` 호출 직후에 이어지는 코드. `balanceDomains()`는 별도 함수로 뒤에 정의(L308)되어 있어, Phase 3의 라인 번호(L231-L254)가 Phase 2(L308-L386)보다 앞섬.
 
-`podsForEviction`에 모인 파드를 순회하며 evict합니다. (`L231-L254`)
+* `podsForEviction`에 모인 파드를 순회하며 evict (`L231-L254`)
 
 ```go
 for pod := range podsForEviction {  // L232
@@ -297,14 +324,14 @@ for pod := range podsForEviction {  // L232
 }
 ```
 
-`RemoveDuplicates`와 달리, TSC 플러그인은 eviction을 두 단계로 분리합니다. `balanceDomains()`에서는 **후보만 선정**하고, 실제 eviction은 모든 TSC 처리가 끝난
-뒤 한꺼번에 수행합니다. 이렇게 하면 여러 TSC가 동일한 파드를 두 번 evict하는 것을 방지할 수 있습니다.
+* `RemoveDuplicates`와 달리 eviction을 두 단계로 분리 — `balanceDomains()`에서 **후보만 선정**, 실제 eviction은 모든 TSC 처리 후 한꺼번에 수행
+* 여러 TSC가 동일 파드를 중복 선정해도 맵이므로 자동 중복 제거
 
 ## 3. 정리 및 비교
 
 ### 두 플러그인 비교
 
-두 플러그인 모두 `BalancePlugin`을 구현하지만, 감지하는 문제와 해결 방식이 다릅니다.
+* 두 플러그인 모두 `BalancePlugin` 구현 — 감지하는 문제와 해결 방식이 다름
 
 #### 문제 정의
 
@@ -346,24 +373,26 @@ RemovePodsViolatingTopologySpreadConstraint
 
 ### Descheduler 운영 시 주의사항
 
-#### eviction은 재스케줄링을 보장하지 않습니다
+#### eviction은 재스케줄링을 보장하지 않음
 
-Descheduler는 파드를 evict할 뿐, 어디로 재배치될지는 kube-scheduler가 결정합니다. evict 후 동일한 노드로 돌아올 수도 있습니다. 특히 `NodeFit` 옵션이 꺼져 있으면 갈 곳 없는
-파드도 evict됩니다.
+* Descheduler는 파드를 evict할 뿐, 재배치 위치는 kube-scheduler가 결정
+* evict 후 동일 노드로 돌아올 수도 있음 — `NodeFit` 옵션이 꺼져 있으면 갈 곳 없는 파드도 evict됨
 
 ```
 권장: DefaultEvictor의 NodeFit 옵션 활성화
 → PreEvictionFilter 단계에서 다른 노드에 스케줄 가능한지 확인 후 evict
 ```
 
+> **NodeFit**: eviction 전 "다른 노드에 실제로 스케줄 가능한가"를 미리 확인하는 옵션 — 갈 곳 없는 파드는 evict하지 않음
+
 #### PDB 설정 필수
 
-PodDisruptionBudget(PDB)이 없으면 Descheduler가 동시에 너무 많은 파드를 evict해 서비스 중단이 발생할 수 있습니다. `PodEvictor`는 eviction 전 PDB를 확인하므로,
-중요한 워크로드에는 반드시 PDB를 설정해야 합니다.
+* PDB 없으면 동시 다수 eviction으로 서비스 중단 가능
+* `PodEvictor`는 eviction 전 PDB 확인 — 중요 워크로드에는 반드시 PDB 설정
 
 #### eviction 한도 설정
 
-Policy에서 3가지 한도를 조합해 과도한 eviction을 방지합니다.
+* Policy에서 3가지 한도를 조합해 과도한 eviction 방지:
 
 ```yaml
 maxNoOfPodsToEvictPerNode: 5        # 노드당 한 루프에 최대 eviction 수
@@ -373,13 +402,13 @@ maxNoOfPodsToEvictTotal: 50         # 전체 한 루프에 최대 eviction 수
 
 #### 실행 전 dry-run 확인
 
-Descheduler는 `--dry-run` 플래그를 지원합니다. 실제 eviction 없이 어떤 파드가 evict 대상이 되는지 로그로 확인할 수 있습니다. 운영 환경 적용 전에 반드시 dry-run을 먼저
-실행해야 합니다.
+* `--dry-run` 플래그 지원 — 실제 eviction 없이 evict 대상을 로그로 확인 가능
+* 운영 환경 적용 전 반드시 dry-run 먼저 실행
 
 #### Deployment 모드의 interval 설정
 
-interval이 너무 짧으면 이전 eviction으로 인한 재스케줄링이 완료되기 전에 다음 루프가 돌아 불필요한 eviction이 반복될 수 있습니다. 클러스터 규모와 kube-scheduler의 처리 속도를
-고려해 충분한 interval을 설정해야 합니다.
+* interval이 너무 짧으면 재스케줄링 완료 전 다음 루프가 돌아 불필요한 eviction 반복 가능
+* 클러스터 규모와 kube-scheduler 처리 속도를 고려해 충분한 interval 설정
 
 ---
 
@@ -419,7 +448,7 @@ Descheduler 있을 때:
 | `DefaultEvictor`                              | evict 부작용 방지                         | NodeFit · PDB 확인 후 최종 승인       |
 | **Descheduler 전체**                            | kube-scheduler의 일회성 배치 결정을 주기적으로 재검토 | 매 루프마다 플러그인을 실행해 최적 상태 유지      |
 
-> **kube-scheduler는 "지금 최선"을 고릅니다. Descheduler는 "지금도 최선인지"를 주기적으로 되묻습니다.**
+> **kube-scheduler는 "지금 최선"을 고름. Descheduler는 "지금도 최선인지"를 주기적으로 되물음.**
 
 ---
 
