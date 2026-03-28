@@ -194,18 +194,19 @@ d.balanceDomains(ctx, podsForEviction, tsc, constraintTopologies, sumPods, nodes
 
 #### Phase 2: balanceDomains() — two-pointer
 
-모든 TSC 처리가 끝나면 `podsForEviction`을 실제로 evict합니다. 이 집합을 채우는 핵심 로직이 `balanceDomains()`입니다.
+`balanceDomains()`는 `podsForEviction` 집합을 채우는 핵심 로직입니다. 실제 eviction은 모든 TSC 처리가 끝난 뒤 Phase 3에서 한꺼번에 수행합니다.
 
 ```go
 func (d *...) balanceDomains(...) {  // L308
-    idealAvg := sumPods / float64(len(constraintTopologies))  // L309
+    idealAvg := sumPods / float64(len(constraintTopologies)) // L309
     sortedDomains := sortDomains(constraintTopologies, ...)   // L311: 파드 수 오름차순 정렬
     ...
-    i := 0                        // L320: 가장 작은 도메인 포인터
-    j := len(sortedDomains) - 1   // L321: 가장 큰 도메인 포인터
+    i := 0 // L320: 가장 작은 도메인 포인터
+    j := len(sortedDomains) - 1 // L321: 가장 큰 도메인 포인터
 ```
 
-`sortDomains()`는 도메인을 파드 수 오름차순으로 정렬하고, 각 도메인 안의 파드도 eviction 우선순위 순으로 정렬합니다. 슬라이스 **뒤쪽**이 우선 evict 대상이며, 뒤쪽부터 순서는 다음과 같습니다.
+`sortDomains()`는 도메인을 파드 수 오름차순으로 정렬하고, 각 도메인 안의 파드도 eviction 우선순위 순으로 정렬합니다. 슬라이스 **뒤쪽**이 우선 evict 대상이며, 뒤쪽부터 순서는 다음과
+같습니다.
 
 ```
 ← 보호 (앞)                                         evict 우선 (뒤) →
@@ -214,7 +215,8 @@ func (d *...) balanceDomains(...) {  // L308
 
 즉, **셀렉터/affinity가 없고 우선순위가 높은 파드**가 가장 먼저 evict 대상이 됩니다.
 
-> **참고**: 소스 코드의 주석(L419, L464)은 "낮은 우선순위를 먼저 evict"하겠다는 의도를 기술하고 있습니다. 그러나 실제 구현에서 `!comparePodsByPriority`는 낮은 우선순위를 슬라이스 앞쪽에, 높은 우선순위를 뒤쪽에 배치합니다. eviction이 뒤쪽부터 가져가므로 결과적으로 **높은 우선순위가 먼저 evict**됩니다. 코드 주석과 구현이 불일치하는 사례입니다.
+> **참고**: 소스 코드의 주석(L419, L464)은 "낮은 우선순위를 먼저 evict"하겠다는 의도를 기술하고 있습니다. 그러나 실제 구현에서 `!comparePodsByPriority`는 낮은 우선순위를
+> 슬라이스 앞쪽에, 높은 우선순위를 뒤쪽에 배치합니다. eviction이 뒤쪽부터 가져가므로 결과적으로 **높은 우선순위가 먼저 evict**됩니다. 코드 주석과 구현이 불일치하는 사례입니다.
 
 two-pointer 루프: (`L322-L386`)
 
@@ -225,7 +227,7 @@ for i < j {  // L322
         j--; continue
     }
 
-    skew := float64(len(sortedDomains[j].pods) - len(sortedDomains[i].pods))  // L329
+    skew := float64(len(sortedDomains[j].pods) - len(sortedDomains[i].pods)) // L329
 
     // skew가 maxSkew 이내면 이 쌍은 허용 범위 → i를 올림
     if int32(skew) <= tsc.MaxSkew {  // L332
@@ -233,12 +235,15 @@ for i < j {  // L322
     }
 
     // 이동할 파드 수 계산 (세 가지 제약 중 최솟값)
-    aboveAvg  := math.Ceil(float64(len(sortedDomains[j].pods)) - idealAvg)  // L343: j가 평균 초과분
-    belowAvg  := math.Ceil(idealAvg - float64(len(sortedDomains[i].pods)))  // L344: i가 평균 미달분
-    halfSkew  := math.Ceil((skew - float64(tsc.MaxSkew)) / 2)               // L346: skew 절반
-    movePods  := int(math.Min(math.Min(aboveAvg, belowAvg), halfSkew))      // L347
+    aboveAvg := math.Ceil(float64(len(sortedDomains[j].pods)) - idealAvg) // L343: j가 평균 초과분
+    belowAvg := math.Ceil(idealAvg - float64(len(sortedDomains[i].pods))) // L344: i가 평균 미달분
+    halfSkew := math.Ceil((skew - float64(tsc.MaxSkew)) / 2) // L346: skew 허용 초과분의 절반
+    movePods := int(math.Min(math.Min(aboveAvg, belowAvg), halfSkew)) // L347
 
     if movePods <= 0 { i++; continue }  // L348
+    // halfSkew: 한 쌍에서 과도하게 evict하는 것을 막는 제약.
+    // i 도메인은 다른 iteration에서 j 역할의 도메인으로부터도 채워질 수 있으므로,
+    // 현재 j에서 skew를 단독으로 0까지 줄이려 하면 전체적으로 과잉 eviction이 발생한다.
 
     // j의 뒤쪽 movePods개를 podsForEviction에 추가  (L362-L383)
     aboveToEvict := sortedDomains[j].pods[len(sortedDomains[j].pods)-movePods:]
@@ -246,24 +251,26 @@ for i < j {  // L322
         podsForEviction[aboveToEvict[k]] = struct{}{}  // L382
     }
     // 도메인 파드 수 갱신 (알고리즘 진행용 추적)
-    sortedDomains[j].pods = sortedDomains[j].pods[:len(sortedDomains[j].pods)-movePods]  // L384
-    sortedDomains[i].pods = append(sortedDomains[i].pods, aboveToEvict...)               // L385
+    sortedDomains[j].pods = sortedDomains[j].pods[:len(sortedDomains[j].pods)-movePods] // L384
+    sortedDomains[i].pods = append(sortedDomains[i].pods, aboveToEvict...) // L385
 }
 ```
 
 예시 (`maxSkew=1`, 도메인 6개):
 
+> **참고**: 파드 수가 바뀌어도 배열을 재정렬하지 않습니다. 괄호 안 숫자는 해당 인덱스의 현재 파드 수입니다.
+
 ```
 초기 정렬: [2, 3, 5, 5, 7, 8]  idealAvg = 30/6 = 5
 
 i=0(2), j=5(8): skew=6 > 1, aboveAvg=3, belowAvg=3, halfSkew=3 → movePods=3
-  [5, 3, 5, 5, 7, 5]
+  → idx 0: 2→5, idx 5: 8→5  [5, 3, 5, 5, 7, 5]
 
 i=0(5), j=5(5): j ≤ idealAvg → j--
 i=0(5), j=4(7): skew=2 > 1, aboveAvg=2, belowAvg=0 → movePods=0 → i++
 
 i=1(3), j=4(7): skew=4 > 1, aboveAvg=2, belowAvg=2, halfSkew=2 → movePods=2
-  [5, 5, 5, 5, 5, 5]
+  → idx 1: 3→5, idx 4: 7→5  [5, 5, 5, 5, 5, 5]
 
 i=1(5), j=4(5): j ≤ idealAvg → j-- ... i >= j → 종료
 ```
@@ -278,13 +285,14 @@ for pod := range podsForEviction {  // L232
     if !d.podFilter(pod) { continue }                     // L236: Filter 재확인
 
     if d.handle.Evictor().PreEvictionFilter(pod) {        // L240: 최종 확인 (NodeFit 등)
-        err := d.handle.Evictor().Evict(ctx, pod, ...)    // L241
+        err := d.handle.Evictor().Evict(ctx, pod, ...) // L241
         ...
     }
 }
 ```
 
-`RemoveDuplicates`와 달리, TSC 플러그인은 eviction을 두 단계로 분리합니다. `balanceDomains()`에서는 **후보만 선정**하고, 실제 eviction은 모든 TSC 처리가 끝난 뒤 한꺼번에 수행합니다. 이렇게 하면 여러 TSC가 동일한 파드를 두 번 evict하는 것을 방지할 수 있습니다.
+`RemoveDuplicates`와 달리, TSC 플러그인은 eviction을 두 단계로 분리합니다. `balanceDomains()`에서는 **후보만 선정**하고, 실제 eviction은 모든 TSC 처리가 끝난
+뒤 한꺼번에 수행합니다. 이렇게 하면 여러 TSC가 동일한 파드를 두 번 evict하는 것을 방지할 수 있습니다.
 
 ## 3. 정리 및 비교
 
@@ -294,27 +302,27 @@ for pod := range podsForEviction {  // L232
 
 #### 문제 정의
 
-| | RemoveDuplicates | RemovePodsViolatingTopologySpreadConstraint |
-|---|---|---|
-| **감지 대상** | 같은 owner의 파드가 한 노드에 2개 이상 몰린 경우 | TSC의 maxSkew를 초과한 도메인 간 불균형 |
-| **범위** | 노드 단위 | 토폴로지 도메인 단위 (zone, region 등) |
-| **트리거 조건** | 명시적 규칙 없이 소유자 기준 자동 감지 | 파드에 TSC가 명시되어 있어야 동작 |
+|            | RemoveDuplicates                | RemovePodsViolatingTopologySpreadConstraint |
+|------------|---------------------------------|---------------------------------------------|
+| **감지 대상**  | 같은 owner의 파드가 한 노드에 2개 이상 몰린 경우 | TSC의 maxSkew를 초과한 도메인 간 불균형                 |
+| **범위**     | 노드 단위                           | 토폴로지 도메인 단위 (zone, region 등)                |
+| **트리거 조건** | 명시적 규칙 없이 소유자 기준 자동 감지          | 파드에 TSC가 명시되어 있어야 동작                        |
 
 #### 감지 방식
 
-| | RemoveDuplicates | RemovePodsViolatingTopologySpreadConstraint |
-|---|---|---|
-| **집계 단위** | 노드별 `podContainerKeys` 비교 | 네임스페이스별 TSC 수집 → 도메인별 파드 수 집계 |
-| **빈 버킷 처리** | `duplicatePods`에 기록 없음 (Phase 2에서 처리) | `constraintTopologies` 초기화 시 빈 도메인도 미리 등록 |
-| **기준 계산** | `upperAvg = ceil(전체 파드 수 / targetNode 수)` | `idealAvg = 전체 파드 수 / 도메인 수` |
+|             | RemoveDuplicates                          | RemovePodsViolatingTopologySpreadConstraint |
+|-------------|-------------------------------------------|---------------------------------------------|
+| **집계 단위**   | 노드별 `podContainerKeys` 비교                 | 네임스페이스별 TSC 수집 → 도메인별 파드 수 집계               |
+| **빈 버킷 처리** | `duplicatePods`에 기록 없음 (Phase 2에서 처리)     | `constraintTopologies` 초기화 시 빈 도메인도 미리 등록   |
+| **기준 계산**   | `upperAvg = ceil(전체 파드 수 / targetNode 수)` | `idealAvg = 전체 파드 수 / 도메인 수`                |
 
 #### 알고리즘
 
-| | RemoveDuplicates | RemovePodsViolatingTopologySpreadConstraint |
-|---|---|---|
-| **핵심 알고리즘** | 단순 임계값 비교 (`len(pods)+1 > upperAvg`) | two-pointer on sorted domains |
-| **eviction 시점** | 초과분 발견 즉시 evict | 모든 TSC 처리 후 `podsForEviction` 한꺼번에 evict |
-| **즉시 evict 이유** | ownerKey별 독립 처리, 중복 eviction 위험 없음 | 여러 TSC가 동일 파드를 중복 선정할 수 있어 일괄 처리 필요 |
+|                 | RemoveDuplicates                     | RemovePodsViolatingTopologySpreadConstraint |
+|-----------------|--------------------------------------|---------------------------------------------|
+| **핵심 알고리즘**     | 단순 임계값 비교 (`len(pods)+1 > upperAvg`) | two-pointer on sorted domains               |
+| **eviction 시점** | 초과분 발견 즉시 evict                      | 모든 TSC 처리 후 `podsForEviction` 한꺼번에 evict    |
+| **즉시 evict 이유** | ownerKey별 독립 처리, 중복 eviction 위험 없음   | 여러 TSC가 동일 파드를 중복 선정할 수 있어 일괄 처리 필요         |
 
 #### 시각적 비교
 
@@ -334,7 +342,8 @@ RemovePodsViolatingTopologySpreadConstraint
 
 #### eviction은 재스케줄링을 보장하지 않습니다
 
-Descheduler는 파드를 evict할 뿐, 어디로 재배치될지는 kube-scheduler가 결정합니다. evict 후 동일한 노드로 돌아올 수도 있습니다. 특히 `NodeFit` 옵션이 꺼져 있으면 갈 곳 없는 파드도 evict됩니다.
+Descheduler는 파드를 evict할 뿐, 어디로 재배치될지는 kube-scheduler가 결정합니다. evict 후 동일한 노드로 돌아올 수도 있습니다. 특히 `NodeFit` 옵션이 꺼져 있으면 갈 곳 없는
+파드도 evict됩니다.
 
 ```
 권장: DefaultEvictor의 NodeFit 옵션 활성화
@@ -343,7 +352,8 @@ Descheduler는 파드를 evict할 뿐, 어디로 재배치될지는 kube-schedul
 
 #### PDB 설정 필수
 
-PodDisruptionBudget(PDB)이 없으면 Descheduler가 동시에 너무 많은 파드를 evict해 서비스 중단이 발생할 수 있습니다. `PodEvictor`는 eviction 전 PDB를 확인하므로, 중요한 워크로드에는 반드시 PDB를 설정해야 합니다.
+PodDisruptionBudget(PDB)이 없으면 Descheduler가 동시에 너무 많은 파드를 evict해 서비스 중단이 발생할 수 있습니다. `PodEvictor`는 eviction 전 PDB를 확인하므로,
+중요한 워크로드에는 반드시 PDB를 설정해야 합니다.
 
 #### eviction 한도 설정
 
@@ -357,11 +367,13 @@ maxNoOfPodsToEvictTotal: 50         # 전체 한 루프에 최대 eviction 수
 
 #### 실행 전 dry-run 확인
 
-Descheduler는 `--dry-run` 플래그를 지원합니다. 실제 eviction 없이 어떤 파드가 evict 대상이 되는지 로그로 확인할 수 있습니다. 운영 환경 적용 전에 반드시 dry-run을 먼저 실행해야 합니다.
+Descheduler는 `--dry-run` 플래그를 지원합니다. 실제 eviction 없이 어떤 파드가 evict 대상이 되는지 로그로 확인할 수 있습니다. 운영 환경 적용 전에 반드시 dry-run을 먼저
+실행해야 합니다.
 
 #### Deployment 모드의 interval 설정
 
-interval이 너무 짧으면 이전 eviction으로 인한 재스케줄링이 완료되기 전에 다음 루프가 돌아 불필요한 eviction이 반복될 수 있습니다. 클러스터 규모와 kube-scheduler의 처리 속도를 고려해 충분한 interval을 설정해야 합니다.
+interval이 너무 짧으면 이전 eviction으로 인한 재스케줄링이 완료되기 전에 다음 루프가 돌아 불필요한 eviction이 반복될 수 있습니다. 클러스터 규모와 kube-scheduler의 처리 속도를
+고려해 충분한 interval을 설정해야 합니다.
 
 ---
 
@@ -394,12 +406,12 @@ Descheduler 있을 때:
 
 ### 핵심 takeaway
 
-| 구성 요소 | 역할 | 핵심 메커니즘 |
-|---|---|---|
-| `RemoveDuplicates` | 같은 owner의 파드가 특정 노드에 몰린 경우 해소 | `upperAvg` 기준 초과분 즉시 evict |
-| `RemovePodsViolatingTopologySpreadConstraint` | TSC `maxSkew` 위반 상태 해소 | two-pointer로 최소 이동 evict 후보 선정 |
-| `DefaultEvictor` | evict 부작용 방지 | NodeFit · PDB 확인 후 최종 승인 |
-| **Descheduler 전체** | kube-scheduler의 일회성 배치 결정을 주기적으로 재검토 | 매 루프마다 플러그인을 실행해 최적 상태 유지 |
+| 구성 요소                                         | 역할                                   | 핵심 메커니즘                        |
+|-----------------------------------------------|--------------------------------------|--------------------------------|
+| `RemoveDuplicates`                            | 같은 owner의 파드가 특정 노드에 몰린 경우 해소        | `upperAvg` 기준 초과분 즉시 evict     |
+| `RemovePodsViolatingTopologySpreadConstraint` | TSC `maxSkew` 위반 상태 해소               | two-pointer로 최소 이동 evict 후보 선정 |
+| `DefaultEvictor`                              | evict 부작용 방지                         | NodeFit · PDB 확인 후 최종 승인       |
+| **Descheduler 전체**                            | kube-scheduler의 일회성 배치 결정을 주기적으로 재검토 | 매 루프마다 플러그인을 실행해 최적 상태 유지      |
 
 > **kube-scheduler는 "지금 최선"을 고릅니다. Descheduler는 "지금도 최선인지"를 주기적으로 되묻습니다.**
 
@@ -407,14 +419,14 @@ Descheduler 있을 때:
 
 ## 부록: 주요 코드 경로
 
-| 항목 | 경로 |
-|---|---|
-| 진입점 | `cmd/descheduler/descheduler.go` |
-| 서버 초기화 | `cmd/descheduler/app/server.go` |
-| 핵심 루프 | `pkg/descheduler/descheduler.go` |
-| 플러그인 인터페이스 | `pkg/framework/types/types.go` |
-| Profile 초기화 | `pkg/framework/profile/profile.go` |
-| DefaultEvictor | `pkg/framework/plugins/defaultevictor/defaultevictor.go` |
-| Eviction 처리 | `pkg/descheduler/evictions/evictions.go` |
-| RemoveDuplicates | `pkg/framework/plugins/removeduplicates/removeduplicates.go` |
-| TSC 플러그인 | `pkg/framework/plugins/removepodsviolatingtopologyspreadconstraint/topologyspreadconstraint.go` |
+| 항목               | 경로                                                                                              |
+|------------------|-------------------------------------------------------------------------------------------------|
+| 진입점              | `cmd/descheduler/descheduler.go`                                                                |
+| 서버 초기화           | `cmd/descheduler/app/server.go`                                                                 |
+| 핵심 루프            | `pkg/descheduler/descheduler.go`                                                                |
+| 플러그인 인터페이스       | `pkg/framework/types/types.go`                                                                  |
+| Profile 초기화      | `pkg/framework/profile/profile.go`                                                              |
+| DefaultEvictor   | `pkg/framework/plugins/defaultevictor/defaultevictor.go`                                        |
+| Eviction 처리      | `pkg/descheduler/evictions/evictions.go`                                                        |
+| RemoveDuplicates | `pkg/framework/plugins/removeduplicates/removeduplicates.go`                                    |
+| TSC 플러그인         | `pkg/framework/plugins/removepodsviolatingtopologyspreadconstraint/topologyspreadconstraint.go` |
