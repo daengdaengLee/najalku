@@ -401,6 +401,75 @@ if labelChanged || controllerRefChanged {
 
 * WorkQueue에서 꺼낸 키(namespace/name)로 실제 조정을 수행하는 핵심 함수
 
+### worker → syncReplicaSet 연결
+
+```
+NewBaseController()
+  └─ rsc.syncHandler = rsc.syncReplicaSet     (L269)
+
+Run(ctx, workers)
+  ├─ WaitForNamedCacheSyncWithContext(...)      (L294) — Informer 캐시 동기화 대기
+  └─ workers 수만큼 goroutine 생성             (L298~302)
+       └─ worker(ctx)                           (L622~624)
+            └─ for { processNextWorkItem(ctx) } (L623)
+                 ├─ queue.Get()                 (L628)
+                 ├─ syncHandler(ctx, key)       (L634) — == syncReplicaSet
+                 ├─ 성공 → queue.Forget(key)    (L636)
+                 └─ 실패 → queue.AddRateLimited(key) (L641) — 재시도 큐에 재삽입
+```
+
+> `pkg/controller/replicaset/replica_set.go:L269`
+
+```go
+rsc.syncHandler = rsc.syncReplicaSet
+```
+
+> `pkg/controller/replicaset/replica_set.go:L275~304`
+
+```go
+func (rsc *ReplicaSetController) Run(ctx context.Context, workers int) {
+    ...
+    if !cache.WaitForNamedCacheSyncWithContext(ctx, rsc.podListerSynced, rsc.rsListerSynced) {
+        return
+    }
+    for i := 0; i < workers; i++ {
+        wg.Go(func() {
+            wait.UntilWithContext(ctx, rsc.worker, time.Second)
+        })
+    }
+    <-ctx.Done()
+}
+```
+
+> `pkg/controller/replicaset/replica_set.go:L622~641`
+
+```go
+func (rsc *ReplicaSetController) worker(ctx context.Context) {
+    for rsc.processNextWorkItem(ctx) {
+    }
+}
+
+func (rsc *ReplicaSetController) processNextWorkItem(ctx context.Context) bool {
+    key, quit := rsc.queue.Get()
+    if quit { return false }
+    defer rsc.queue.Done(key)
+
+    err := rsc.syncHandler(ctx, key)
+    if err == nil {
+        rsc.queue.Forget(key)
+        return true
+    }
+    rsc.queue.AddRateLimited(key)
+    return true
+}
+```
+
+* `syncHandler`를 필드로 저장하여 간접 호출 — 테스트 시 mock 함수로 교체 가능
+* `Run()` 시작 시 Informer 캐시 동기화 완료를 대기한 후 worker 시작
+* worker는 무한 루프로 큐에서 키를 꺼내 `syncHandler` 호출
+* 성공 시 `queue.Forget(key)` — 재시도 카운터 초기화
+* 실패 시 `queue.AddRateLimited(key)` — 지수 백오프 후 재시도
+
 ### 처리 흐름 개요
 
 ```
