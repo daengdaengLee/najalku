@@ -473,6 +473,7 @@ func (rsc *ReplicaSetController) processNextWorkItem(ctx context.Context) bool {
 ### 처리 흐름 개요
 
 ```
+// pkg/controller/replicaset/replica_set.go:L755
 syncReplicaSet(key)
   │
   ├─ ReplicaSet 조회 (rsLister)
@@ -490,7 +491,191 @@ syncReplicaSet(key)
   └─ 상태 업데이트 (updateReplicaSetStatus)
 ```
 
-* (상세 코드 분석 예정)
+### 상세 코드 분석
+
+#### 1단계 — RS 조회
+
+> `pkg/controller/replicaset/replica_set.go:L778~787`
+
+```go
+rs, err := rsc.rsLister.ReplicaSets(namespace).Get(name)
+if apierrors.IsNotFound(err) {
+    rsc.expectations.DeleteExpectations(logger, key)
+    return nil
+}
+```
+
+* 로컬 캐시에서 RS 조회 — API 서버 호출 없음
+* `IsNotFound` → RS 이미 삭제됨 → expectations 정리 후 정상 종료
+    * `nil` 반환으로 worker가 `queue.Forget(key)` 호출 → 재시도 카운터 초기화
+* 조회한 RS는 "Informer가 마지막으로 수신한 스냅샷" — 실제 현재 상태와 약간의 차이 가능
+
+##### 비고 — queue.Forget 동작
+
+`RateLimitingInterface`는 두 개의 독립된 상태를 관리함
+
+| 레이어 | 관련 메서드 | 추적 내용 |
+|--------|------------|----------|
+| Base Queue | `Get()`, `Done(key)` | 현재 처리 중인 키 (`processing` 집합) |
+| Rate Limiter | `AddRateLimited(key)`, `Forget(key)` | 키별 실패 횟수 (`failures map[key]int`) |
+
+`processNextWorkItem` 흐름:
+
+```go
+key, quit := rsc.queue.Get()       // processing 집합에 추가
+defer rsc.queue.Done(key)          // 항상: processing에서 제거
+
+err := rsc.syncHandler(ctx, key)
+if err == nil {
+    rsc.queue.Forget(key)          // 성공 시: rate limiter 실패 카운터 삭제
+    return true
+}
+rsc.queue.AddRateLimited(key)      // 실패 시: backoff delay 후 큐 재삽입
+return true
+```
+
+* `Forget(key)` = rate limiter의 `delete(failures, key)` — 큐에서 제거하는 게 아님
+* 기본 backoff: `baseDelay(5ms) * 2^실패횟수`, 최대 1000s
+    * `Forget` 없이 성공하면 `failures` 맵에 이전 실패 횟수가 남음 → 다음 실패 시 누적된 backoff 적용
+    * `Forget` 호출 → 카운터 초기화 → 다음 실패부터 5ms로 재시작
+* `Done`과 `Forget`은 완전히 다른 레이어 — `Forget`만 호출하고 `Done` 생략 시 해당 키가 `processing`에 남아 큐에서 재처리 불가
+
+#### 2단계 — Pod 목록 수집 & 분류
+
+> `pkg/controller/replicaset/replica_set.go:L797~813`
+
+```go
+allRSPods, err := controller.FilterPodsByOwner(rsc.podIndexer, &rs.ObjectMeta, rsc.Kind, true)
+
+allActivePods := controller.FilterActivePods(logger, allRSPods)
+activePods, err := rsc.claimPods(ctx, rs, selector, allActivePods)
+
+allTerminatingPods := controller.FilterTerminatingPods(allRSPods)
+terminatingPods := controller.FilterClaimedPods(rs, selector, allTerminatingPods)
+```
+
+* `FilterPodsByOwner`: RS UID로 인덱싱된 Pod + 셀렉터 매칭 고아 Pod 전부 수집
+* `FilterActivePods`: Succeeded / Failed / 이미 삭제된 Pod 제외 → Active Pod만 추출
+* `claimPods`: Active Pod 중 셀렉터 매칭 확인 → 고아 Pod 입양 → 최종 `activePods` 반환
+    * 입양 성공한 고아 Pod도 `activePods`에 포함 → 이후 diff 계산에 반영
+
+**Terminating Pod 분리** (feature gate `DeploymentReplicaSetTerminatingReplicas`)
+* `DeletionTimestamp` 설정된 Pod를 Active에서 분리
+* `manageReplicas`의 active 카운트에 포함 안 됨 → Terminating Pod를 active로 보면 diff = 0으로 판단해 대체 Pod 생성 안 됨 → 분리함으로써 즉시 대체 Pod 생성 가능
+* status 계산에는 별도로 전달 → `TerminatingReplicas` 필드 반영
+
+#### 3단계 — expectations 확인 & manageReplicas 호출 조건
+
+> `pkg/controller/replicaset/replica_set.go:L789, L818~820`
+
+```go
+rsNeedsSync := rsc.expectations.SatisfiedExpectations(logger, key)
+...
+if rsNeedsSync && rs.DeletionTimestamp == nil {
+    manageReplicasErr = rsc.manageReplicas(ctx, activePods, rs)
+}
+```
+
+* `rsNeedsSync = true` 조건 (둘 중 하나)
+    * add/del expectations가 모두 0 — 미충족 작업 없음
+    * expectations TTL 만료 — 무한 블로킹 방지
+* `rs.DeletionTimestamp == nil` 조건
+    * RS 삭제 중 → 새 Pod 생성 불필요, 삭제 대상 Pod는 GC에 위임
+* 두 조건 중 하나라도 불만족 → `manageReplicas` 건너뜀 → 상태 업데이트만 수행
+
+#### 4단계 — manageReplicas: diff 계산 및 분기
+
+> `pkg/controller/replicaset/replica_set.go:L650`
+
+```go
+diff := len(activePods) - int(*(rs.Spec.Replicas))
+```
+
+* `diff < 0`: 파드 부족 → 생성 경로
+* `diff > 0`: 파드 과잉 → 삭제 경로
+* `diff == 0`: 아무 작업 없음
+
+**생성 경로 (diff < 0)**
+
+> `pkg/controller/replicaset/replica_set.go:L657~698`
+
+```go
+diff = min(-diff, rsc.burstReplicas)
+rsc.expectations.ExpectCreations(logger, rsKey, diff)
+successfulCreations, err := slowStartBatch(diff, controller.SlowStartInitialBatchSize, func() error {
+    return rsc.podControl.CreatePods(...)
+})
+// slowStartBatch 중단으로 시도 못 한 Pod 수만큼 expectations 즉시 차감
+for i := 0; i < diff-successfulCreations; i++ {
+    rsc.expectations.CreationObserved(logger, rsKey)
+}
+```
+
+* `burstReplicas` 상한 적용 (기본 500)
+* `ExpectCreations(diff)` **먼저** 등록 → 이후 Pod Add 이벤트가 차감
+* 배치 중단 시 건너뛴 수만큼 즉시 차감 → Informer 이벤트 없이 선제 차감하지 않으면 블로킹
+
+**삭제 경로 (diff > 0)**
+
+> `pkg/controller/replicaset/replica_set.go:L700~747`
+
+```go
+diff = min(diff, rsc.burstReplicas)
+podsToDelete := getPodsToDelete(activePods, relatedPods, diff)
+rsc.expectations.ExpectDeletions(logger, rsKey, getPodKeys(podsToDelete))
+var wg sync.WaitGroup
+wg.Add(diff)
+for _, pod := range podsToDelete {
+    go func(targetPod *v1.Pod) {
+        defer wg.Done()
+        if err := rsc.podControl.DeletePod(...); err != nil {
+            rsc.expectations.DeletionObserved(logger, rsKey, podKey)  // 실패 시 즉시 차감
+        }
+    }(pod)
+}
+wg.Wait()
+```
+
+* `ExpectDeletions` **먼저** 등록 (UID 목록) → Pod Delete 이벤트가 차감
+* 삭제는 **병렬 goroutine** — 각 삭제 독립적, 실패해도 다른 삭제에 영향 없음
+* 삭제 API 실패 시 즉시 차감 → 다음 Reconcile에서 재시도
+
+**생성 vs 삭제 비대칭 설계**
+
+| | 생성 | 삭제 |
+|---|---|---|
+| 실행 방식 | `slowStartBatch` — 순차 배치, 오류 시 중단 | 병렬 goroutine, 오류 시 개별 처리 |
+| 이유 | 실패 원인(쿼터 부족 등)이 동일 → 전부 시도 전에 빠르게 중단이 유리 | 실패가 독립적 → 병렬 처리로 지연 없음 |
+
+#### 5단계 — 상태 업데이트
+
+> `pkg/controller/replicaset/replica_set.go:L824~831`
+
+```go
+newStatus := calculateStatus(rs, activePods, terminatingPods, manageReplicasErr, ...)
+updatedRS, err := updateReplicaSetStatus(logger, rsc.kubeClient.AppsV1().ReplicaSets(rs.Namespace), rs, newStatus, ...)
+```
+
+* `manageReplicas` 오류 여부와 무관하게 **항상** 상태 업데이트 실행
+* `calculateStatus`: `ReadyReplicas`, `AvailableReplicas`, `TerminatingReplicas` 등 계산
+* `updateReplicaSetStatus`: API 서버에 status 패치 (로컬 캐시가 아닌 실제 저장)
+* 오류 순서: 상태 업데이트 오류 → 즉시 반환 / `manageReplicas` 오류 → 상태 업데이트 후 반환
+
+#### 6단계 — MinReadySeconds 재동기화 예약
+
+> `pkg/controller/replicaset/replica_set.go:L844~855`
+
+```go
+if updatedRS.Spec.MinReadySeconds > 0 &&
+    updatedRS.Status.ReadyReplicas != updatedRS.Status.AvailableReplicas {
+    nextSyncDuration = ...
+    rsc.queue.AddAfter(key, *nextSyncDuration)
+}
+```
+
+* `MinReadySeconds`: Pod가 Ready 상태로 N초 유지돼야 Available로 간주
+* Ready지만 아직 Available 아닌 Pod 존재 → N초 후 재동기화 예약
+* 예약 없으면 Available 전환 시 Informer 이벤트가 없어 status 업데이트 누락 가능
 
 ---
 
