@@ -282,19 +282,38 @@ rsc.enqueueRS(curRS)
     * status 업데이트로 불필요한 Reconcile이 일부 발생하지만 로컬 캐시만 읽으므로 부하 없음
     * Pod 생성 실패로 멈춘 RS를 Informer 전체 재동기화 시 복구 가능
 * UID 변경 감지 (같은 이름으로 RS 재생성된 경우)
-    * Informer가 Delete + Add 대신 하나의 Update로 합칠 수 있는 알려진 한계
+    * Informer가 Delete + Add 대신 하나의 Update로 합칠 수 있는 알려진 한계 (소스 TODO 주석 확인)
     * `curRS.UID != oldRS.UID` → `deleteRS(oldRS)` 호출로 이전 RS의 stale expectations 강제 삭제
     * 이 처리 없으면 새 RS가 이전 RS의 미충족 expectations를 물려받아 영구 블로킹 위험
+    * `oldRS`를 `cache.DeletedFinalStateUnknown`으로 감싸 전달 — `deleteRS`의 tombstone 처리 코드 재사용
 
 **`deleteRS()`**
 
-> `pkg/controller/replicaset/replica_set.go:L452~459`
+> `pkg/controller/replicaset/replica_set.go:L429~459`
 
 ```go
+// tombstone 처리 — k8s 컨트롤러 Delete 핸들러 표준 패턴
+rs, ok := obj.(*apps.ReplicaSet)
+if !ok {
+    tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+    if !ok { ... }
+    rs, ok = tombstone.Obj.(*apps.ReplicaSet)
+    if !ok { ... }
+}
+
+// ...
 rsc.expectations.DeleteExpectations(logger, key)
 rsc.queue.Add(key)
 ```
 
+* **tombstone (`DeletedFinalStateUnknown`) 2단계 type assertion** — k8s 컨트롤러 Delete 핸들러 표준 패턴
+    * 1단계: `obj`를 `*apps.ReplicaSet`으로 직접 assertion → 정상 Delete 이벤트
+    * 2단계: 실패 시 `cache.DeletedFinalStateUnknown`으로 assertion → tombstone에서 `.Obj` 추출
+* **tombstone이란** — Watch 연결 끊김 후 Relist 시 DeltaFIFO가 합성하는 가짜 Delete 이벤트 래퍼
+    * Watch가 끊긴 사이에 삭제된 오브젝트 → Delete 이벤트 미수신
+    * Relist로 받은 새 목록에 해당 키 없음 → DeltaFIFO가 "삭제됐음"을 추론
+    * 마지막으로 알려진(stale할 수 있는) 오브젝트를 `DeletedFinalStateUnknown{Key, Obj}`로 감싸 전달
+    * 정의: `staging/src/k8s.io/client-go/tools/cache/delta_fifo.go:L793~800`
 * `expectations.DeleteExpectations(key)` — 해당 RS의 expectations 전부 삭제
 * `queue.Add(key)` — Reconcile 기회 부여 (이미 삭제됐으면 즉시 종료)
 
