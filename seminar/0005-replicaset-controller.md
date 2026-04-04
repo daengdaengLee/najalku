@@ -7,6 +7,21 @@
 
 ---
 
+## 핵심 한 줄 요약
+
+> **"현재 Pod 수를 `spec.replicas`와 일치시키는 것 — 그것이 전부"**
+
+* 부족하면 Pod 생성, 초과하면 Pod 삭제
+* API 서버 상태가 바뀔 때마다 반복 수행 (Reconcile Loop)
+
+| 하는 것 | 하지 않는 것 (다른 컴포넌트 책임) |
+|---|---|
+| Pod 수 조정 (생성/삭제) | 노드 스케줄링 결정 (→ Scheduler) |
+| ReplicaSet 소유 Pod 추적 | 컨테이너 실행 관리 (→ Kubelet) |
+| 고아 Pod 입양/방출 | 롤링 업데이트 전략 (→ Deployment Controller) |
+
+---
+
 ## 목차
 
 1. 사전 학습 요약 — client-go Informer & WorkQueue
