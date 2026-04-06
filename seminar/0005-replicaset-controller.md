@@ -182,73 +182,167 @@ API Server ──► Deployment 오브젝트 저장
 
 ---
 
-## 4. ReplicaSet Controller 초기화 — Informer 연결
+## 4. ReplicaSet Controller 초기화 및 실행
 
-* 진입점: `pkg/controller/replicaset/replica_set.go`
-* `NewReplicaSetController()` — 컨트롤러 생성 및 Informer 이벤트 핸들러 등록
+### 전체 호출 경로
 
-### `ReplicaSetController` 주요 필드
+```
+main()                                                           controller-manager.go:L34
+  → NewControllerManagerCommand() → Run()                        controllermanager.go:L102, L185
+      → NewControllerDescriptors()                               controller_descriptor.go:L148
+          newReplicaSetControllerDescriptor()                    apps.go:L94
+      → BuildControllers() → BuildController()                   controllermanager.go:L571
+          → newReplicaSetController()                            apps.go:L102
+              → NewReplicaSetController()                        replica_set.go:L155
+                  → NewBaseController()                          replica_set.go:L204
+                      rsc.syncHandler = rsc.syncReplicaSet       replica_set.go:L269
+      → RunControllers() → controller.Run()                      controllermanager.go:L655
+          → rsc.Run(ctx, workers)                                replica_set.go:L275
+              → wait.UntilWithContext(rsc.worker, 1s)            replica_set.go:L300
+                  → rsc.worker()                                 replica_set.go:L622
+                      → rsc.processNextWorkItem()                replica_set.go:L627
+                          → rsc.syncHandler() = syncReplicaSet() replica_set.go:L634
+```
 
-| 필드              | 타입                                              | 역할                                |
-|-----------------|-------------------------------------------------|-----------------------------------|
-| `kubeClient`    | `clientset.Interface`                           | API 서버 호출                         |
-| `podControl`    | `controller.PodControlInterface`                | Pod 생성/삭제 추상화                     |
-| `expectations`  | `*controller.UIDTrackingControllerExpectations` | 진행 중인 작업 추적 — 중복 reconcile 방지     |
-| `queue`         | `workqueue.RateLimitingInterface`               | Reconcile 작업 큐                    |
-| `burstReplicas` | `int`                                           | 한 번에 허용되는 최대 동시 Pod 작업 수 (기본 500) |
-| `rsLister`      | `appslisters.ReplicaSetLister`                  | 로컬 캐시에서 ReplicaSet 조회             |
-| `podLister`     | `corelisters.PodLister`                         | 로컬 캐시에서 Pod 조회                    |
+### 4.1 main() — kube-controller-manager 프로세스 진입
 
-#### `kubeClient`
+> `cmd/kube-controller-manager/controller-manager.go:L34`
 
-* API 서버를 직접 호출하는 범용 클라이언트
-* 로컬 캐시(`rsLister`, `podLister`)는 읽기 전용 → 생성/삭제 시 API 서버 직접 요청 필요
+```go
+func main() {
+    command := app.NewControllerManagerCommand()
+    code := cli.Run(command)
+    os.Exit(code)
+}
+```
 
-#### `podControl`
+> `cmd/kube-controller-manager/app/controllermanager.go:L102, L127~148`
 
-* `kubeClient`를 직접 쓰지 않고 Pod 생성/삭제를 이 인터페이스를 통해 수행
-* 추상화 이유
-    * 테스트 용이성: mock으로 교체 가능
-    * 공통 처리: 이벤트 기록 등을 한 곳에서 처리
+```go
+func NewControllerManagerCommand() *cobra.Command {
+    // ...
+    cmd := &cobra.Command{
+        RunE: func(cmd *cobra.Command, args []string) error {
+            // ...
+            c, err := s.Config(ctx, KnownControllers(), ControllersDisabledByDefault(), ControllerAliases())
+            // ...
+            return Run(ctx, c.Complete())
+        },
+    }
+}
+```
 
-#### `expectations`
+* `main()` → `NewControllerManagerCommand()` → Cobra RunE 핸들러 → `Run(ctx, c.Complete())` 진입
 
-* 문제 상황: Pod 생성 요청 후 캐시 갱신 전에 Reconcile이 재트리거되면 중복 생성 위험
-* 역할: "현재 N개 생성/삭제 요청 중"을 기록 → 미충족 시 `manageReplicas()` 스킵
-* 기록 시점: `manageReplicas()`에서 Pod 생성/삭제 요청 시
-* 해소 시점: Pod Informer EventHandler에서 해당 이벤트 수신 시 (큐 거치지 않고 즉시 처리)
-* 생성(add): 단순 카운터 — Pod Add 이벤트마다 1 차감
-* 삭제(del): UID 목록 추적 — 삭제 요청한 특정 Pod의 UID만 매칭
-    * 단순 카운터일 경우, 다른 Pod 크래시가 삭제 expectations를 잘못 차감할 수 있음
-* TTL: 응답 없어도 만료 후 Reconcile 재개 → 무한 블로킹 방지
+### 4.2 컨트롤러 등록 및 생성
 
-#### `queue`
+> `cmd/kube-controller-manager/app/controllermanager.go:L185, L248~283`
 
-* 1절 `RateLimitingInterface`와 동일한 타입
-* RS Informer와 Pod Informer 모두 이 큐에 **RS 키**를 삽입 — Reconcile 단위는 항상 RS
-* RS Informer EventHandler 동작:
-    * RS 키를 queue에 삽입 → 비동기 처리
-* Pod Informer EventHandler 동작:
-    * expectations 업데이트 → 즉시 처리
-    * Pod의 owner RS 키를 queue에 삽입 → 비동기 처리
+```go
+func Run(ctx context.Context, c *config.CompletedConfig) error {
+    // ...
+    run := func(ctx context.Context, controllerDescriptors map[string]*ControllerDescriptor) {
+        controllerContext, _ := CreateControllerContext(ctx, c, ...)
+        controllers, _ := BuildControllers(ctx, controllerContext, controllerDescriptors, ...)
+        controllerContext.InformerFactory.Start(stopCh)
+        RunControllers(ctx, controllerContext, controllers, ...)
+    }
 
-#### `burstReplicas`
+    // No leader election, run directly
+    controllerDescriptors := NewControllerDescriptors()
+    run(ctx, controllerDescriptors)
+}
+```
 
-* 한 번의 `manageReplicas()` 호출에서 처리 가능한 최대 Pod 수 (기본 500)
-* `slowStartBatch`와의 관계:
+* `NewControllerDescriptors()` — 모든 컨트롤러의 디스크립터(이름 + 생성자 함수)를 맵으로 수집 → 아래에서 상세
+* `run` 클로저 내부:
+    * `BuildControllers()` — 각 디스크립터의 생성자 함수를 호출해 컨트롤러 인스턴스 생성 → 아래에서 상세
+    * `InformerFactory.Start()` — 모든 Informer의 List+Watch 시작 → 4.4에서 상세
+    * `RunControllers()` — 각 컨트롤러를 별도 고루틴으로 실행 → 4.4에서 상세
+
+**컨트롤러 디스크립터 등록**
+
+> `cmd/kube-controller-manager/app/controller_descriptor.go:L148`
+
+```go
+func NewControllerDescriptors() map[string]*ControllerDescriptor {
+    // ...
+    register(newReplicaSetControllerDescriptor())
+}
+```
+
+> `cmd/kube-controller-manager/app/apps.go:L94`
+
+```go
+func newReplicaSetControllerDescriptor() *ControllerDescriptor {
+    return &ControllerDescriptor{
+        name:        names.ReplicaSetController,  // "replicaset-controller"
+        constructor: newReplicaSetController,
+    }
+}
+```
+
+* 각 컨트롤러를 이름 + 생성자 함수로 등록 — 실제 생성은 아직
+
+**컨트롤러 인스턴스 생성**
+
+> `cmd/kube-controller-manager/app/apps.go:L102`
+
+```go
+func newReplicaSetController(ctx context.Context, controllerContext ControllerContext, ...) (Controller, error) {
+    client, _ := controllerContext.NewClient("replicaset-controller")
+    rsc := replicaset.NewReplicaSetController(
+        ctx,
+        controllerContext.InformerFactory.Apps().V1().ReplicaSets(),
+        controllerContext.InformerFactory.Core().V1().Pods(),
+        client,
+        replicaset.BurstReplicas,
+    )
+    return newControllerLoop(func(ctx context.Context) {
+        rsc.Run(ctx, int(controllerContext.ComponentConfig.ReplicaSetController.ConcurrentRSSyncs))
+    }, controllerName), nil
+}
+```
+
+* InformerFactory에서 RS Informer, Pod Informer 주입
+* `rsc.Run`을 `controllerLoop`으로 감싸 `Controller` 인터페이스로 반환
+
+### 4.3 NewReplicaSetController() / NewBaseController() — 구조체 생성
+
+> `pkg/controller/replicaset/replica_set.go:L155, L204`
+
+구조체 생성 시 핵심 필드 초기화:
+
+| 필드 | 역할 |
+|---|---|
+| `kubeClient` | Pod 생성/삭제 등 쓰기 시 API 서버 직접 호출 |
+| `podControl` | `kubeClient` 래퍼 — 테스트 시 mock 교체 가능, 이벤트 기록 일괄 처리 |
+| `expectations` | 진행 중 작업 추적 — 캐시 갱신 전 중복 reconcile 방지 |
+| `queue` | `RateLimitingInterface` — 2절에서 설명한 WorkQueue |
+| `burstReplicas` | 한 번의 reconcile에서 최대 500 Pod 처리 (바깥 한계) |
+| `rsLister` / `podLister` | 로컬 캐시(Indexer) 읽기 전용 — API 서버 호출 없이 메모리 즉시 조회 |
+
+* `rsLister` / `podLister`로 읽고, 쓰기(생성/삭제)는 반드시 `kubeClient`/`podControl`로 API 서버 직접 요청
+* `expectations` 상세:
+    * 문제: Pod 생성 요청 후 캐시 갱신 전에 Reconcile이 재트리거되면 중복 생성 위험
+    * 생성(add): 단순 카운터 — Pod Add 이벤트마다 1 차감
+    * 삭제(del): UID 목록 추적 — 삭제 요청한 특정 Pod의 UID만 매칭 (단순 카운터면 다른 Pod 크래시가 잘못 차감 가능)
+    * TTL: 응답 없어도 만료 후 Reconcile 재개 → 무한 블로킹 방지
+* `burstReplicas`와 `slowStartBatch` 관계:
     * `burstReplicas`: 한 번의 Reconcile에서의 최대 수 제한 (바깥 한계)
-    * `slowStartBatch`: 그 안에서 1→2→4→8 배치로 점진적 생성 (안의 속도 조절) — 5절에서 상세 설명
+    * `slowStartBatch`: 그 안에서 1→2→4→8 배치로 점진적 생성 (안의 속도 조절) — 6절에서 상세 설명
 
-#### `rsLister` / `podLister`
+**핵심 와이어링**
 
-* API 서버가 아닌 로컬 캐시(Indexer)에서 읽는 읽기 전용 인터페이스
-* 캐시를 쓰는 이유: 속도(메모리 즉시 조회), 부하 감소, 일관성(Informer가 Watch로 동기화)
-* 쓰기(생성/삭제/수정)는 반드시 `kubeClient`/`podControl`로 API 서버 직접 요청
+> `pkg/controller/replicaset/replica_set.go:L269`
 
-### Informer 이벤트 핸들러 등록
+```go
+rsc.syncHandler = rsc.syncReplicaSet
+```
 
-* `NewBaseController()` 에서 RS Informer와 Pod Informer 각각에 핸들러 등록
-* 핸들러 함수는 모두 `ReplicaSetController`의 메서드 — 클로저로 캡처된 인스턴스(`rsc`)를 통해 호출
+* `processNextWorkItem`에서 `rsc.syncHandler`를 호출 → 실제 구현인 `syncReplicaSet`으로 연결
+
+**Informer 이벤트 핸들러 등록**
 
 > `pkg/controller/replicaset/replica_set.go:L207, L223~233, L251~264`
 
@@ -268,7 +362,11 @@ podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 })
 ```
 
-#### 유틸 함수: `enqueueRS`
+* RS Informer와 Pod Informer 모두 이 큐에 **RS 키**를 삽입 — Reconcile 단위는 항상 RS
+* RS Informer EventHandler: RS 키를 queue에 삽입 → 비동기 처리
+* Pod Informer EventHandler: expectations 업데이트(즉시) + Pod의 owner RS 키를 queue에 삽입
+
+##### 유틸 함수: `enqueueRS`
 
 > `pkg/controller/replicaset/replica_set.go:L367~375`
 
@@ -285,7 +383,7 @@ func (rsc *ReplicaSetController) enqueueRS(rs *apps.ReplicaSet) {
     * 입력이 RS 오브젝트면 `enqueueRS`, 키를 이미 갖고 있으면 `queue.Add` 직접 호출
     * 결과는 동일
 
-#### RS Informer 핸들러
+##### RS Informer 핸들러
 
 > `pkg/controller/replicaset/replica_set.go:L223~233`
 
@@ -361,7 +459,7 @@ rsc.queue.Add(key)
 * `expectations.DeleteExpectations(key)` — 해당 RS의 expectations 전부 삭제
 * `queue.Add(key)` — Reconcile 기회 부여 (이미 삭제됐으면 즉시 종료)
 
-#### Pod Informer 핸들러
+##### Pod Informer 핸들러
 
 > `pkg/controller/replicaset/replica_set.go:L251~264`
 
@@ -458,43 +556,19 @@ if labelChanged || controllerRefChanged {
 * **ControllerRef 있음** (일반) → owner RS enqueue
 * **고아 Pod의 레이블/ControllerRef 변경** → 매칭 RS 전부 enqueue (입양 가능성 확인)
 
----
+### 4.4 Run() — 워커 시작
 
-## 5. `syncReplicaSet()` — Reconcile 루프
-
-* WorkQueue에서 꺼낸 키(namespace/name)로 실제 조정을 수행하는 핵심 함수
-
-### worker → syncReplicaSet 연결
-
-```
-NewBaseController()
-  └─ rsc.syncHandler = rsc.syncReplicaSet     (L269)
-
-Run(ctx, workers)
-  ├─ WaitForNamedCacheSyncWithContext(...)      (L294) — Informer 캐시 동기화 대기
-  └─ workers 수만큼 goroutine 생성             (L298~302)
-       └─ worker(ctx)                           (L622~624)
-            └─ for { processNextWorkItem(ctx) } (L623)
-                 ├─ queue.Get()                 (L628)
-                 ├─ syncHandler(ctx, key)       (L634) — == syncReplicaSet
-                 ├─ 성공 → queue.Forget(key)    (L636)
-                 └─ 실패 → queue.AddRateLimited(key) (L641) — 재시도 큐에 재삽입
-```
-
-> `pkg/controller/replicaset/replica_set.go:L269`
-
-```go
-rsc.syncHandler = rsc.syncReplicaSet
-```
-
-> `pkg/controller/replicaset/replica_set.go:L275~304`
+> `pkg/controller/replicaset/replica_set.go:L275`
 
 ```go
 func (rsc *ReplicaSetController) Run(ctx context.Context, workers int) {
-    ...
+    rsc.eventBroadcaster.StartStructuredLogging(3)
+    rsc.eventBroadcaster.StartRecordingToSink(...)
+
     if !cache.WaitForNamedCacheSyncWithContext(ctx, rsc.podListerSynced, rsc.rsListerSynced) {
         return
     }
+
     for i := 0; i < workers; i++ {
         wg.Go(func() {
             wait.UntilWithContext(ctx, rsc.worker, time.Second)
@@ -504,7 +578,15 @@ func (rsc *ReplicaSetController) Run(ctx context.Context, workers int) {
 }
 ```
 
-> `pkg/controller/replicaset/replica_set.go:L622~641`
+* 이벤트 브로드캐스터 시작
+* `WaitForNamedCacheSyncWithContext` — RS/Pod Informer 캐시가 모두 동기화될 때까지 블로킹
+    * 캐시 미동기화 상태에서 Reconcile 시작 시 stale 데이터로 잘못된 Pod 수 계산 위험
+* `workers`(기본값: `ConcurrentRSSyncs`) 개의 고루틴 시작
+    * `wait.UntilWithContext(rsc.worker, 1s)` — worker 패닉/종료 시 1초 후 자동 재시작
+
+### 4.5 worker() → processNextWorkItem() — 작업 루프
+
+> `pkg/controller/replicaset/replica_set.go:L622, L627`
 
 ```go
 func (rsc *ReplicaSetController) worker(ctx context.Context) {
@@ -513,25 +595,29 @@ func (rsc *ReplicaSetController) worker(ctx context.Context) {
 }
 
 func (rsc *ReplicaSetController) processNextWorkItem(ctx context.Context) bool {
-    key, quit := rsc.queue.Get()
+    key, quit := rsc.queue.Get()       // 블로킹 대기
     if quit { return false }
     defer rsc.queue.Done(key)
 
-    err := rsc.syncHandler(ctx, key)
+    err := rsc.syncHandler(ctx, key)   // = syncReplicaSet()
     if err == nil {
-        rsc.queue.Forget(key)
+        rsc.queue.Forget(key)          // 성공: rate limiter 초기화
         return true
     }
-    rsc.queue.AddRateLimited(key)
+    rsc.queue.AddRateLimited(key)      // 실패: 지수 백오프 후 재삽입
     return true
 }
 ```
 
-* `syncHandler`를 필드로 저장하여 간접 호출 — 테스트 시 mock 함수로 교체 가능
-* `Run()` 시작 시 Informer 캐시 동기화 완료를 대기한 후 worker 시작
-* worker는 무한 루프로 큐에서 키를 꺼내 `syncHandler` 호출
-* 성공 시 `queue.Forget(key)` — 재시도 카운터 초기화
-* 실패 시 `queue.AddRateLimited(key)` — 지수 백오프 후 재시도
+* `worker`: `processNextWorkItem()`을 큐 종료 시까지 무한 반복
+* `queue.Get()` — 항목이 없으면 블로킹, 있으면 즉시 반환
+* `rsc.syncHandler` = `rsc.syncReplicaSet` (4.3의 와이어링) → 다음 섹션으로 연결
+
+---
+
+## 5. `syncReplicaSet()` — Reconcile 루프
+
+* WorkQueue에서 꺼낸 키(namespace/name)로 실제 조정을 수행하는 핵심 함수
 
 ### 처리 흐름 개요
 
