@@ -7,35 +7,36 @@
 
 ---
 
-## 핵심 한 줄 요약
+## 목차
+
+1. 핵심 한 줄 요약
+2. 사전 학습 요약 — client-go Informer & WorkQueue
+3. Deployment → ReplicaSet → Pod 계층 구조
+4. ReplicaSet Controller 초기화 — Informer 연결
+5. `syncReplicaSet()` — Reconcile 루프
+6. `slowStartBatch()` — 왜 한꺼번에 생성하지 않는가
+7. 고아 파드 입양 & 삭제 대상 선정
+8. 마무리
+9. 부록: 주요 코드 경로
+
+---
+
+## 1. 핵심 한 줄 요약
 
 > **"현재 Pod 수를 `spec.replicas`와 일치시키는 것 — 그것이 전부"**
 
 * 부족하면 Pod 생성, 초과하면 Pod 삭제
 * API 서버 상태가 바뀔 때마다 반복 수행 (Reconcile Loop)
 
-| 하는 것 | 하지 않는 것 (다른 컴포넌트 책임) |
-|---|---|
-| Pod 수 조정 (생성/삭제) | 노드 스케줄링 결정 (→ Scheduler) |
-| ReplicaSet 소유 Pod 추적 | 컨테이너 실행 관리 (→ Kubelet) |
-| 고아 Pod 입양/방출 | 롤링 업데이트 전략 (→ Deployment Controller) |
+| 하는 것                 | 하지 않는 것 (다른 컴포넌트 책임)                 |
+|----------------------|--------------------------------------|
+| Pod 수 조정 (생성/삭제)     | 노드 스케줄링 결정 (→ Scheduler)             |
+| ReplicaSet 소유 Pod 추적 | 컨테이너 실행 관리 (→ Kubelet)               |
+| 고아 Pod 입양/방출         | 롤링 업데이트 전략 (→ Deployment Controller) |
 
 ---
 
-## 목차
-
-1. 사전 학습 요약 — client-go Informer & WorkQueue
-2. Deployment → ReplicaSet → Pod 계층 구조
-3. ReplicaSet Controller 초기화 — Informer 연결
-4. `syncReplicaSet()` — Reconcile 루프
-5. `slowStartBatch()` — 왜 한꺼번에 생성하지 않는가
-6. 고아 파드 입양 & 삭제 대상 선정
-7. 마무리
-8. 부록: 주요 코드 경로
-
----
-
-## 1. 사전 학습 요약 — client-go Informer & WorkQueue
+## 2. 사전 학습 요약 — client-go Informer & WorkQueue
 
 * k8s의 모든 컨트롤러가 변경을 감지하고 반응하는 공통 기반
 * ReplicaSet Controller도 이 패턴 위에서 동작함
@@ -63,17 +64,20 @@
 ```
 [kube-controller-manager 프로세스]
 
-  Informer
-    │  List (초기 전체 목록) + Watch (이후 변경 스트리밍)
-    │  ◄── API Server
-    ▼
- DeltaFIFO ──► Indexer (local cache)
-    │
-    ▼
- EventHandler (Add / Update / Delete)
-    │  key (namespace/name)
-    ▼
- WorkQueue ──► worker goroutine ──► Reconcile()
+  ┌─ SharedIndexInformer ──────────────────────────────┐
+  │                                                    │
+  │  Reflector (List + Watch) ◄── API Server           │
+  │    │                                               │
+  │    ▼                                               │
+  │  DeltaFIFO ──► Indexer (local cache)               │
+  │    │                                               │
+  │    ▼                                               │
+  │  EventHandler (Add / Update / Delete)              │
+  │                                                    │
+  └────────────────────────────────────────────────────┘
+       │  key (namespace/name)
+       ▼
+     WorkQueue ──► worker goroutine ──► Reconcile()
 ```
 
 * **List**: 시작 시 전체 오브젝트 목록 수신 → Indexer 초기화
@@ -85,7 +89,6 @@
 | 패키지              | 타입                      | 역할                     |
 |------------------|-------------------------|------------------------|
 | `tools/cache`    | `SharedIndexInformer`   | List+Watch → 로컬 캐시 동기화 |
-| `tools/cache`    | `DeltaFIFO`             | 변경 이벤트 큐               |
 | `util/workqueue` | `RateLimitingInterface` | 속도 제한이 있는 작업 큐         |
 
 #### `SharedIndexInformer`
@@ -94,13 +97,14 @@
     * kube-controller-manager 안의 수십 개 컨트롤러가 Pod Informer 하나를 공유
 * Index: 로컬 캐시(Indexer)에서 인덱스 기반 빠른 조회 지원
 * List+Watch + 캐시 관리 + 인덱싱을 모두 담당
-
-#### `DeltaFIFO`
-
-* API 서버 이벤트를 EventHandler로 전달 전 쌓아두는 큐
-* Delta: 이벤트 타입 5가지 — `Added`, `Updated`, `Deleted`, `Replaced`, `Sync`
-* FIFO: 선입선출 순서 보장
-* 같은 오브젝트의 이벤트가 여러 개 쌓이면 처리 전까지 병합 → 중복 처리 감소
+* 내부 구성요소:
+    * `Reflector` — List+Watch로 API 서버에서 이벤트 수신
+    * `DeltaFIFO` — 변경 이벤트 버퍼 큐 (내부 구현)
+        * API 서버 이벤트를 EventHandler로 전달 전 쌓아두는 큐
+        * Delta: 이벤트 타입 5가지 — `Added`, `Updated`, `Deleted`, `Replaced`, `Sync`
+        * FIFO: 선입선출 순서 보장
+        * 같은 오브젝트의 이벤트가 여러 개 쌓이면 처리 전까지 병합 → 중복 처리 감소
+    * `Indexer` — 로컬 캐시 + 인덱스 기반 조회
 
 #### `RateLimitingInterface`
 
@@ -111,7 +115,7 @@
 
 ---
 
-## 2. Deployment → ReplicaSet → Pod 계층 구조
+## 3. Deployment → ReplicaSet → Pod 계층 구조
 
 * `kubectl apply -f deployment.yaml` 시 오브젝트 생성 순서
 
@@ -144,16 +148,41 @@ API Server ──► Deployment 오브젝트 저장
         * `spec.replicas` 3→5 변경 → ReplicaSet Informer 감지 → Pod 2개 추가 생성
         * Pod 하나 소멸 → Pod Informer 감지 → Pod 1개 재생성
     * 어느 쪽이 변해도 Reconcile 트리거 → 두 Informer 모두 필요
-
 * 각 레이어가 분리된 이유
     * 롤링 업데이트: Deployment가 구 ReplicaSet ↔ 신 ReplicaSet 비율을 점진적으로 조정
     * 단일 책임
         * ReplicaSet: "몇 개의 파드를 유지할 것인가"만 담당 — 버전이나 업데이트 전략에 관여하지 않음
         * Deployment: "어떤 버전으로, 어떤 전략으로 업데이트할 것인가" 담당
+    * 예시: nginx 1.24 → 1.25 롤링 업데이트 (replicas=3, maxSurge=1, maxUnavailable=0)
+        ```
+        [시작 상태]
+        Deployment (nginx:1.25 적용)
+          ├── RS-old (nginx:1.24) replicas=3  →  Pod-A, Pod-B, Pod-C (Running)
+          └── RS-new (nginx:1.25) replicas=0
+
+        [1단계] Deployment Controller: RS-new replicas 0→1
+          ├── RS-old replicas=3  →  Pod-A, Pod-B, Pod-C
+          └── RS-new replicas=1  →  Pod-D (생성 중)
+                                     └── ReplicaSet Controller가 Pod-D 생성
+
+        [2단계] Pod-D Ready 확인 → Deployment Controller: RS-old replicas 3→2
+          ├── RS-old replicas=2  →  Pod-A, Pod-B  (Pod-C 삭제)
+          │                          └── ReplicaSet Controller가 Pod-C 삭제
+          └── RS-new replicas=1  →  Pod-D
+
+        [3단계~4단계] 반복 ...
+
+        [완료]
+          ├── RS-old replicas=0
+          └── RS-new replicas=3  →  Pod-D, Pod-E, Pod-F
+        ```
+        * Deployment Controller: 각 단계에서 RS-old/RS-new의 replicas 수를 조정 — **전략 결정**
+        * ReplicaSet Controller: replicas 값에 맞춰 Pod 생성/삭제 — **실행만 담당**
+        * ReplicaSet Controller는 버전(nginx:1.24 vs 1.25)을 전혀 모름 — 숫자만 맞춤
 
 ---
 
-## 3. ReplicaSet Controller 초기화 — Informer 연결
+## 4. ReplicaSet Controller 초기화 — Informer 연결
 
 * 진입점: `pkg/controller/replicaset/replica_set.go`
 * `NewReplicaSetController()` — 컨트롤러 생성 및 Informer 이벤트 핸들러 등록
@@ -431,7 +460,7 @@ if labelChanged || controllerRefChanged {
 
 ---
 
-## 4. `syncReplicaSet()` — Reconcile 루프
+## 5. `syncReplicaSet()` — Reconcile 루프
 
 * WorkQueue에서 꺼낸 키(namespace/name)로 실제 조정을 수행하는 핵심 함수
 
@@ -713,7 +742,7 @@ if updatedRS.Spec.MinReadySeconds > 0 &&
 
 ---
 
-## 5. `slowStartBatch()` — 왜 한꺼번에 생성하지 않는가
+## 6. `slowStartBatch()` — 왜 한꺼번에 생성하지 않는가
 
 * Pod를 1→2→4→8 배치로 점진적으로 생성하는 메커니즘
 
@@ -735,7 +764,7 @@ initialCount = 1
 
 ---
 
-## 6. 고아 파드 입양 & 삭제 대상 선정
+## 7. 고아 파드 입양 & 삭제 대상 선정
 
 ### 고아 파드 입양 (Orphan Adoption)
 
@@ -767,7 +796,7 @@ ownerReferences 없는 파드
 
 ---
 
-## 7. 마무리
+## 8. 마무리
 
 ### ReplicaSet Controller = k8s 컨트롤러 패턴의 교과서
 
@@ -783,7 +812,7 @@ ownerReferences 없는 파드
 
 ---
 
-## 8. 부록: 주요 코드 경로
+## 9. 부록: 주요 코드 경로
 
 | 항목            | 경로                                                                         |
 |---------------|----------------------------------------------------------------------------|
