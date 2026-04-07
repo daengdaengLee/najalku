@@ -254,6 +254,10 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 }
 ```
 
+* `// No leader election, run directly` — HA 환경에서 KCM 프로세스를 여러 개 띄우는 경우 리더 1개만 reconcile 실행(중복 처리·race 방지), 세미나에서는 단순화를 위해 leader election OFF 경로만 설명
+    * ON 경로(기본값 `--leader-elect=true`): `leaderElectAndRun` 고루틴으로 경합 참여 → `OnStartedLeading` 콜백에서 `run(ctx, ...)` 실행, `OnStoppedLeading`에서 프로세스 종료
+    * OFF 경로(`--leader-elect=false`): `run(ctx, ...)` 바로 호출 — 코드 블록에 발췌된 경로
+    * 리더 결정: `kube-system` 네임스페이스의 Lease 오브젝트를 주기적으로 renew, 갱신 끊기면 다른 인스턴스가 낙관적 잠금으로 획득
 * `NewControllerDescriptors()` — 모든 컨트롤러의 디스크립터(이름 + 생성자 함수)를 맵으로 수집 → 아래에서 상세
 * `run` 클로저 내부:
     * `BuildControllers()` — 각 디스크립터의 생성자 함수를 호출해 컨트롤러 인스턴스 생성 → 아래에서 상세
