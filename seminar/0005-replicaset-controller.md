@@ -286,6 +286,74 @@ func newReplicaSetControllerDescriptor() *ControllerDescriptor {
 
 **컨트롤러 인스턴스 생성**
 
+> `cmd/kube-controller-manager/app/controllermanager.go:L248, L280`
+
+```go
+run := func(ctx context.Context, controllerDescriptors map[string]*ControllerDescriptor) {
+    controllerContext, _ := CreateControllerContext(ctx, c, ...)
+    controllers, _ := BuildControllers(ctx, controllerContext, controllerDescriptors, ...)
+    // ...
+}
+
+// No leader election, run directly
+controllerDescriptors := NewControllerDescriptors()
+run(ctx, controllerDescriptors)
+```
+
+* `Run` 함수(L185)에서 leader election 분기 후 `run` 클로저 호출 — no-leader-election 경로에서 `NewControllerDescriptors()` 결과를 그대로 인자로 전달
+* `run` 클로저 내부에서 `CreateControllerContext`로 informer·client가 포함된 `controllerContext` 생성 후 `BuildControllers` 호출 — 여기서 디스크립터 맵을 실제 인스턴스로 펼치는 단계 시작
+
+> `cmd/kube-controller-manager/app/controllermanager.go:L571, L578, L628`
+
+```go
+func BuildControllers(ctx context.Context, controllerCtx ControllerContext,
+    controllerDescriptors map[string]*ControllerDescriptor, ...) ([]Controller, error) {
+
+    buildController := func(controllerDesc *ControllerDescriptor) error {
+        ctrl, err := controllerDesc.BuildController(ctx, controllerCtx)
+        // ...
+        controllers = append(controllers, ctrl)
+        return nil
+    }
+
+    // SA Token Controller 먼저 빌드
+    buildController(controllerDescriptors[names.ServiceAccountTokenController])
+
+    for _, controllerDesc := range controllerDescriptors {
+        if controllerDesc.RequiresSpecialHandling() { continue }
+        if !controllerCtx.IsControllerEnabled(controllerDesc) { continue }
+        buildController(controllerDesc)
+    }
+    return controllers, nil
+}
+```
+
+* 디스크립터 맵을 순회하며 `buildController` 클로저로 각 컨트롤러 빌드
+* SA Token Controller 우선 빌드 — 다른 컨트롤러들이 이후 크리덴셜을 받으려면 필요
+* `RequiresSpecialHandling` 또는 비활성화된 컨트롤러는 skip
+* 빌드 결과 `Controller` 인터페이스를 `controllers` 슬라이스에 수집 → `RunControllers`에서 사용
+
+> `cmd/kube-controller-manager/app/controller_descriptor.go:L93`
+
+```go
+func (r *ControllerDescriptor) BuildController(ctx context.Context, controllerCtx ControllerContext) (Controller, error) {
+    // 요구 feature gate 비활성 시 nil 반환(skip)
+    for _, featureGate := range r.GetRequiredFeatureGates() {
+        if !utilfeature.DefaultFeatureGate.Enabled(featureGate) { return nil, nil }
+    }
+    // cloud provider controller skip
+    if r.IsCloudProviderController() { return nil, nil }
+
+    return r.GetControllerConstructor()(ctx, controllerCtx, controllerName)
+}
+```
+
+* feature gate·cloud provider 조건 미충족 시 skip
+* 통과 시 디스크립터에 등록된 `constructor` 필드(`newReplicaSetController`) 직접 호출 → 실제 구조체 생성 시작
+
+호출 체인 요약:
+`Run` → `run` 클로저 → `BuildControllers` → `buildController` 클로저 → `ControllerDescriptor.BuildController` → `newReplicaSetController`
+
 > `cmd/kube-controller-manager/app/apps.go:L102`
 
 ```go
