@@ -254,7 +254,7 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 }
 ```
 
-* `// No leader election, run directly` — HA 환경에서 KCM 프로세스를 여러 개 띄우는 경우 리더 1개만 reconcile 실행(중복 처리·race 방지), 세미나에서는 단순화를 위해 leader election OFF 경로만 설명
+* `// No leader election, run directly` — HA 환경에서 KCM(kube-controller-manager) 프로세스를 여러 개 띄우는 경우 리더 1개만 reconcile 실행(중복 처리·race 방지), 세미나에서는 단순화를 위해 leader election OFF 경로만 설명
     * ON 경로(기본값 `--leader-elect=true`): `leaderElectAndRun` 고루틴으로 경합 참여 → `OnStartedLeading` 콜백에서 `run(ctx, ...)` 실행, `OnStoppedLeading`에서 프로세스 종료
     * OFF 경로(`--leader-elect=false`): `run(ctx, ...)` 바로 호출 — 코드 블록에 발췌된 경로
     * 리더 결정: `kube-system` 네임스페이스의 Lease 오브젝트를 주기적으로 renew, 갱신 끊기면 다른 인스턴스가 낙관적 잠금으로 획득
@@ -305,7 +305,49 @@ run(ctx, controllerDescriptors)
 ```
 
 * `Run` 함수(L185)에서 leader election 분기 후 `run` 클로저 호출 — no-leader-election 경로에서 `NewControllerDescriptors()` 결과를 그대로 인자로 전달
-* `run` 클로저 내부에서 `CreateControllerContext`로 informer·client가 포함된 `controllerContext` 생성 후 `BuildControllers` 호출 — 여기서 디스크립터 맵을 실제 인스턴스로 펼치는 단계 시작
+* `run` 클로저 내부에서 `CreateControllerContext`로 `controllerContext` 생성 후 `BuildControllers` 호출 — 여기서 디스크립터 맵을 실제 인스턴스로 펼치는 단계 시작
+
+**ControllerContext — 공유 자원 묶음**
+
+> `cmd/kube-controller-manager/app/controllermanager.go:L408`
+
+```go
+type ControllerContext struct {
+    ClientBuilder                   clientbuilder.ControllerClientBuilder
+    InformerFactory                 informers.SharedInformerFactory
+    ObjectOrMetadataInformerFactory informerfactory.InformerFactory
+    ComponentConfig                 kubectrlmgrconfig.KubeControllerManagerConfiguration
+    RESTMapper                      *restmapper.DeferredDiscoveryRESTMapper
+    InformersStarted                chan struct{}
+    ResyncPeriod                    func() time.Duration
+    ControllerManagerMetrics        *controllersmetrics.ControllerManagerMetrics
+    GraphBuilder                    *garbagecollector.GraphBuilder
+}
+```
+
+모든 컨트롤러 생성자에 그대로 전달되는 컨테이너. `CreateControllerContext`(L475)에서 아래 순서로 채움:
+
+1. `rootClientBuilder`로 shared-informers 전용 클라이언트 생성
+2. `SharedInformerFactory` 생성 — 모든 컨트롤러가 공유하는 캐시
+3. metadata-only 클라이언트 + `ObjectOrMetadataInformerFactory` 생성
+4. API 서버 최대 10초 대기
+5. `DeferredDiscoveryRESTMapper` 생성 (30초마다 갱신)
+6. 필드 조립 후 반환; GC 활성 시 `GraphBuilder`도 초기화
+
+필드별 역할:
+
+| 필드 | 역할 |
+|---|---|
+| `ClientBuilder` | 컨트롤러별 전용 클라이언트 팩토리 — `NewClient("replicaset-controller")`로 호출 |
+| `InformerFactory` | 공유 typed informer 팩토리 — RS·Pod informer를 여기서 꺼냄 |
+| `ComponentConfig` | kube-controller-manager 전체 설정 — `ConcurrentRSSyncs` 등 컨트롤러별 값 보관 |
+| `ResyncPeriod` | jitter 적용 재동기화 주기 반환 함수 — 컨트롤러 동시 리스트 폭발 방지 |
+| `InformersStarted` | informer 시작 완료 시 close되는 채널 — 의존 컨트롤러가 대기 |
+| `ObjectOrMetadataInformerFactory` | metadata-only informer 팩토리 — GC 등 메타데이터만 필요한 컨트롤러용 |
+| `RESTMapper` | GVR↔GVK 매핑 — GC·dynamic 컨트롤러 전용 |
+| `GraphBuilder` | GC 의존성 그래프 — GC 컨트롤러 전용 |
+
+헬퍼 메서드(L446): `controllerContext.NewClient(name)`은 `ClientBuilder.Client(name)` 래퍼 — L365에서 바로 사용.
 
 > `cmd/kube-controller-manager/app/controllermanager.go:L571, L578, L628`
 
@@ -333,8 +375,10 @@ func BuildControllers(ctx context.Context, controllerCtx ControllerContext,
 ```
 
 * 디스크립터 맵을 순회하며 `buildController` 클로저로 각 컨트롤러 빌드
-* SA Token Controller 우선 빌드 — 다른 컨트롤러들이 이후 크리덴셜을 받으려면 필요
-* `RequiresSpecialHandling` 또는 비활성화된 컨트롤러는 skip
+* SA Token Controller 우선 빌드 — 실패 시 즉시 에러 반환, 다른 컨트롤러 빌드 중단
+  * 역할: 클러스터 전체 ServiceAccount의 토큰 Secret 생성·관리 — Pod가 마운트하는 `/var/run/secrets/kubernetes.io/serviceaccount/token`도 이 컨트롤러가 채움
+  * 왜 먼저: 클러스터 필수 기능이므로 빌드 실패 시 fast-fail — 나머지 컨트롤러를 빌드하기 전에 실패를 조기에 감지하기 위함
+* `RequiresSpecialHandling` 또는 비활성화된 컨트롤러는 skip — `RequiresSpecialHandling = true`는 현재 SA Token Controller 하나뿐, 이 플래그로 2단계 순회 시 중복 빌드 방지
 * 빌드 결과 `Controller` 인터페이스를 `controllers` 슬라이스에 수집 → `RunControllers`에서 사용
 
 > `cmd/kube-controller-manager/app/controller_descriptor.go:L93`
