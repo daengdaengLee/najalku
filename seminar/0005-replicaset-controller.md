@@ -336,16 +336,16 @@ type ControllerContext struct {
 
 필드별 역할:
 
-| 필드 | 역할 |
-|---|---|
-| `ClientBuilder` | 컨트롤러별 전용 클라이언트 팩토리 — `NewClient("replicaset-controller")`로 호출 |
-| `InformerFactory` | 공유 typed informer 팩토리 — RS·Pod informer를 여기서 꺼냄 |
-| `ComponentConfig` | kube-controller-manager 전체 설정 — `ConcurrentRSSyncs` 등 컨트롤러별 값 보관 |
-| `ResyncPeriod` | jitter 적용 재동기화 주기 반환 함수 — 컨트롤러 동시 리스트 폭발 방지 |
-| `InformersStarted` | informer 시작 완료 시 close되는 채널 — 의존 컨트롤러가 대기 |
-| `ObjectOrMetadataInformerFactory` | metadata-only informer 팩토리 — GC 등 메타데이터만 필요한 컨트롤러용 |
-| `RESTMapper` | GVR↔GVK 매핑 — GC·dynamic 컨트롤러 전용 |
-| `GraphBuilder` | GC 의존성 그래프 — GC 컨트롤러 전용 |
+| 필드                                | 역할                                                               |
+|-----------------------------------|------------------------------------------------------------------|
+| `ClientBuilder`                   | 컨트롤러별 전용 클라이언트 팩토리 — `NewClient("replicaset-controller")`로 호출    |
+| `InformerFactory`                 | 공유 typed informer 팩토리 — RS·Pod informer를 여기서 꺼냄                  |
+| `ComponentConfig`                 | kube-controller-manager 전체 설정 — `ConcurrentRSSyncs` 등 컨트롤러별 값 보관 |
+| `ResyncPeriod`                    | jitter 적용 재동기화 주기 반환 함수 — 컨트롤러 동시 리스트 폭발 방지                      |
+| `InformersStarted`                | informer 시작 완료 시 close되는 채널 — 의존 컨트롤러가 대기                        |
+| `ObjectOrMetadataInformerFactory` | metadata-only informer 팩토리 — GC 등 메타데이터만 필요한 컨트롤러용               |
+| `RESTMapper`                      | GVR↔GVK 매핑 — GC·dynamic 컨트롤러 전용                                  |
+| `GraphBuilder`                    | GC 의존성 그래프 — GC 컨트롤러 전용                                          |
 
 헬퍼 메서드(L446): `controllerContext.NewClient(name)`은 `ClientBuilder.Client(name)` 래퍼 — L365에서 바로 사용.
 
@@ -381,6 +381,7 @@ func BuildControllers(ctx context.Context, controllerCtx ControllerContext,
 * `RequiresSpecialHandling` 또는 비활성화된 컨트롤러는 skip — `RequiresSpecialHandling = true`는 현재 SA Token Controller 하나뿐, 이 플래그로 2단계 순회 시 중복 빌드 방지
 * 빌드 결과 `Controller` 인터페이스를 `controllers` 슬라이스에 수집 → `RunControllers`에서 사용
 
+// @TODO: 여기부터
 > `cmd/kube-controller-manager/app/controller_descriptor.go:L93`
 
 ```go
@@ -429,14 +430,14 @@ func newReplicaSetController(ctx context.Context, controllerContext ControllerCo
 
 구조체 생성 시 핵심 필드 초기화:
 
-| 필드 | 역할 |
-|---|---|
-| `kubeClient` | Pod 생성/삭제 등 쓰기 시 API 서버 직접 호출 |
-| `podControl` | `kubeClient` 래퍼 — 테스트 시 mock 교체 가능, 이벤트 기록 일괄 처리 |
-| `expectations` | 진행 중 작업 추적 — 캐시 갱신 전 중복 reconcile 방지 |
-| `queue` | `RateLimitingInterface` — 2절에서 설명한 WorkQueue |
-| `burstReplicas` | 한 번의 reconcile에서 최대 500 Pod 처리 (바깥 한계) |
-| `rsLister` / `podLister` | 로컬 캐시(Indexer) 읽기 전용 — API 서버 호출 없이 메모리 즉시 조회 |
+| 필드                       | 역할                                               |
+|--------------------------|--------------------------------------------------|
+| `kubeClient`             | Pod 생성/삭제 등 쓰기 시 API 서버 직접 호출                    |
+| `podControl`             | `kubeClient` 래퍼 — 테스트 시 mock 교체 가능, 이벤트 기록 일괄 처리 |
+| `expectations`           | 진행 중 작업 추적 — 캐시 갱신 전 중복 reconcile 방지             |
+| `queue`                  | `RateLimitingInterface` — 2절에서 설명한 WorkQueue     |
+| `burstReplicas`          | 한 번의 reconcile에서 최대 500 Pod 처리 (바깥 한계)           |
+| `rsLister` / `podLister` | 로컬 캐시(Indexer) 읽기 전용 — API 서버 호출 없이 메모리 즉시 조회    |
 
 * `rsLister` / `podLister`로 읽고, 쓰기(생성/삭제)는 반드시 `kubeClient`/`podControl`로 API 서버 직접 요청
 * `expectations` 상세:
@@ -779,9 +780,9 @@ if apierrors.IsNotFound(err) {
 
 `RateLimitingInterface`는 두 개의 독립된 상태를 관리함
 
-| 레이어 | 관련 메서드 | 추적 내용 |
-|--------|------------|----------|
-| Base Queue | `Get()`, `Done(key)` | 현재 처리 중인 키 (`processing` 집합) |
+| 레이어          | 관련 메서드                               | 추적 내용                             |
+|--------------|--------------------------------------|-----------------------------------|
+| Base Queue   | `Get()`, `Done(key)`                 | 현재 처리 중인 키 (`processing` 집합)      |
 | Rate Limiter | `AddRateLimited(key)`, `Forget(key)` | 키별 실패 횟수 (`failures map[key]int`) |
 
 `processNextWorkItem` 흐름:
@@ -907,10 +908,10 @@ wg.Wait()
 
 **생성 vs 삭제 비대칭 설계**
 
-| | 생성 | 삭제 |
-|---|---|---|
-| 실행 방식 | `slowStartBatch` — 순차 배치, 오류 시 중단 | 병렬 goroutine, 오류 시 개별 처리 |
-| 이유 | 실패 원인(쿼터 부족 등)이 동일 → 전부 시도 전에 빠르게 중단이 유리 | 실패가 독립적 → 병렬 처리로 지연 없음 |
+|       | 생성                                       | 삭제                       |
+|-------|------------------------------------------|--------------------------|
+| 실행 방식 | `slowStartBatch` — 순차 배치, 오류 시 중단        | 병렬 goroutine, 오류 시 개별 처리 |
+| 이유    | 실패 원인(쿼터 부족 등)이 동일 → 전부 시도 전에 빠르게 중단이 유리 | 실패가 독립적 → 병렬 처리로 지연 없음   |
 
 #### 5단계 — 상태 업데이트
 
