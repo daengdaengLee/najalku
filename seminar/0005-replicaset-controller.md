@@ -325,29 +325,22 @@ type ControllerContext struct {
 }
 ```
 
-모든 컨트롤러 생성자에 그대로 전달되는 컨테이너. `CreateControllerContext`(L475)에서 아래 순서로 채움:
+모든 컨트롤러 생성자에 그대로 전달되는 컨테이너. `CreateControllerContext`(L475)에서 아래 순서로 채움 (RS 컨트롤러 관련 단계만):
 
 1. `rootClientBuilder`로 shared-informers 전용 클라이언트 생성
 2. `SharedInformerFactory` 생성 — 모든 컨트롤러가 공유하는 캐시
-3. metadata-only 클라이언트 + `ObjectOrMetadataInformerFactory` 생성
-4. API 서버 최대 10초 대기
-5. `DeferredDiscoveryRESTMapper` 생성 (30초마다 갱신)
-6. 필드 조립 후 반환; GC 활성 시 `GraphBuilder`도 초기화
+3. API 서버 최대 10초 대기
+4. 필드 조립 후 반환
 
-필드별 역할:
+필드별 역할 (RS 컨트롤러가 실제 사용하는 필드):
 
-| 필드                                | 역할                                                               |
-|-----------------------------------|------------------------------------------------------------------|
-| `ClientBuilder`                   | 컨트롤러별 전용 클라이언트 팩토리 — `NewClient("replicaset-controller")`로 호출    |
-| `InformerFactory`                 | 공유 typed informer 팩토리 — RS·Pod informer를 여기서 꺼냄                  |
-| `ComponentConfig`                 | kube-controller-manager 전체 설정 — `ConcurrentRSSyncs` 등 컨트롤러별 값 보관 |
-| `ResyncPeriod`                    | jitter 적용 재동기화 주기 반환 함수 — 컨트롤러 동시 리스트 폭발 방지                      |
-| `InformersStarted`                | informer 시작 완료 시 close되는 채널 — 의존 컨트롤러가 대기                        |
-| `ObjectOrMetadataInformerFactory` | metadata-only informer 팩토리 — GC 등 메타데이터만 필요한 컨트롤러용               |
-| `RESTMapper`                      | GVR↔GVK 매핑 — GC·dynamic 컨트롤러 전용                                  |
-| `GraphBuilder`                    | GC 의존성 그래프 — GC 컨트롤러 전용                                          |
+| 필드              | 역할                                                               |
+|-----------------|------------------------------------------------------------------|
+| `ClientBuilder` | 컨트롤러별 전용 k8s API 클라이언트 팩토리 — `NewClient("replicaset-controller")`로 호출    |
+| `InformerFactory` | 공유 typed informer 팩토리 — RS·Pod informer를 여기서 꺼냄              |
+| `ComponentConfig` | kube-controller-manager 전체 설정 — `ConcurrentRSSyncs` 등 컨트롤러별 값 보관 |
 
-헬퍼 메서드(L446): `controllerContext.NewClient(name)`은 `ClientBuilder.Client(name)` 래퍼 — L365에서 바로 사용.
+* `ControllerContext`는 ReplicaSet, Deployment, DaemonSet, GC 등 kube-controller-manager 내 모든 컨트롤러가 공유하는 컨테이너임. 여기서는 ReplicaSet Controller가 실제로 사용하는 필드만 정리함.
 
 > `cmd/kube-controller-manager/app/controllermanager.go:L571, L578, L628`
 

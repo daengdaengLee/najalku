@@ -3,4 +3,4 @@
 	url = git@github.com:daengdaengLee/descheduler.git
 [submodule "kubernetes"]
 	path = kubernetes
-	url = git@github.com:daengdaengLee/kubernetes.git
+	url = https://github.com/daengdaengLee/kubernetes.git
