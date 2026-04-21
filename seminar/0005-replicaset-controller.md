@@ -336,7 +336,7 @@ type ControllerContext struct {
 
 | 필드              | 역할                                                               |
 |-----------------|------------------------------------------------------------------|
-| `ClientBuilder` | 컨트롤러별 전용 클라이언트 팩토리 — `NewClient("replicaset-controller")`로 호출    |
+| `ClientBuilder` | 컨트롤러별 전용 k8s API 클라이언트 팩토리 — `NewClient("replicaset-controller")`로 호출    |
 | `InformerFactory` | 공유 typed informer 팩토리 — RS·Pod informer를 여기서 꺼냄              |
 | `ComponentConfig` | kube-controller-manager 전체 설정 — `ConcurrentRSSyncs` 등 컨트롤러별 값 보관 |
 
