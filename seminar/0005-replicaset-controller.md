@@ -342,12 +342,12 @@ type ControllerContext struct {
 | `InformerFactory`                 | 공유 typed informer 팩토리 — RS·Pod informer를 여기서 꺼냄                  |
 | `ComponentConfig`                 | kube-controller-manager 전체 설정 — `ConcurrentRSSyncs` 등 컨트롤러별 값 보관 |
 | `ResyncPeriod`                    | jitter 적용 재동기화 주기 반환 함수 — 컨트롤러 동시 리스트 폭발 방지                      |
-| `InformersStarted`                | informer 시작 완료 시 close되는 채널 — 의존 컨트롤러가 대기                        |
+| `InformersStarted`                | Informer 고루틴 기동 직후 close되는 채널 — GC GraphBuilder·ResourceQuota 컨트롤러 등이 informer 기동 완료 확인에 사용 |
 | `ObjectOrMetadataInformerFactory` | metadata-only informer 팩토리 — GC 등 메타데이터만 필요한 컨트롤러용               |
 | `RESTMapper`                      | GVR↔GVK 매핑 — GC·dynamic 컨트롤러 전용                                  |
 | `GraphBuilder`                    | GC 의존성 그래프 — GC 컨트롤러 전용                                          |
 
-헬퍼 메서드(L446): `controllerContext.NewClient(name)`은 `ClientBuilder.Client(name)` 래퍼 — L365에서 바로 사용.
+헬퍼 메서드(L464): `controllerContext.NewClient(name)`은 `ClientBuilder.Client(name)` 래퍼 — `apps.go:L103`에서 바로 사용.
 
 > `cmd/kube-controller-manager/app/controllermanager.go:L571, L578, L628`
 
