@@ -342,8 +342,6 @@ type ControllerContext struct {
 
 * `ControllerContext`는 ReplicaSet, Deployment, DaemonSet, GC 등 kube-controller-manager 내 모든 컨트롤러가 공유하는 컨테이너임. 여기서는 ReplicaSet Controller가 실제로 사용하는 필드만 정리함.
 
-헬퍼 메서드(L464): `controllerContext.NewClient(name)`은 `ClientBuilder.Client(name)` 래퍼 — `apps.go:L103`에서 바로 사용.
-
 > `cmd/kube-controller-manager/app/controllermanager.go:L571, L578, L628`
 
 ```go
