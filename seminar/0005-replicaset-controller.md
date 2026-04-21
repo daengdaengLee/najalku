@@ -340,7 +340,7 @@ type ControllerContext struct {
 | `InformerFactory` | 공유 typed informer 팩토리 — RS·Pod informer를 여기서 꺼냄              |
 | `ComponentConfig` | kube-controller-manager 전체 설정 — `ConcurrentRSSyncs` 등 컨트롤러별 값 보관 |
 
-* `ControllerContext`는 ReplicaSet, Deployment, DaemonSet, GC 등 kube-controller-manager 내 모든 컨트롤러가 공유하는 컨테이너다. 여기서는 ReplicaSet Controller가 실제로 사용하는 필드만 정리했다.
+* `ControllerContext`는 ReplicaSet, Deployment, DaemonSet, GC 등 kube-controller-manager 내 모든 컨트롤러가 공유하는 컨테이너임. 여기서는 ReplicaSet Controller가 실제로 사용하는 필드만 정리함.
 
 헬퍼 메서드(L464): `controllerContext.NewClient(name)`은 `ClientBuilder.Client(name)` 래퍼 — `apps.go:L103`에서 바로 사용.
 
