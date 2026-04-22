@@ -180,8 +180,6 @@ API Server ──► Deployment 오브젝트 저장
         * ReplicaSet Controller: replicas 값에 맞춰 Pod 생성/삭제 — **실행만 담당**
         * ReplicaSet Controller는 버전(nginx:1.24 vs 1.25)을 전혀 모름 — 숫자만 맞춤
 
----
-
 ## 4. ReplicaSet Controller 초기화 및 실행
 
 ### 전체 호출 경로
@@ -334,11 +332,11 @@ type ControllerContext struct {
 
 필드별 역할 (RS 컨트롤러가 실제 사용하는 필드):
 
-| 필드              | 역할                                                               |
-|-----------------|------------------------------------------------------------------|
-| `ClientBuilder` | 컨트롤러별 전용 k8s API 클라이언트 팩토리 — `NewClient("replicaset-controller")`로 호출    |
-| `InformerFactory` | 공유 typed informer 팩토리 — RS·Pod informer를 여기서 꺼냄              |
-| `ComponentConfig` | kube-controller-manager 전체 설정 — `ConcurrentRSSyncs` 등 컨트롤러별 값 보관 |
+| 필드                | 역할                                                                    |
+|-------------------|-----------------------------------------------------------------------|
+| `ClientBuilder`   | 컨트롤러별 전용 k8s API 클라이언트 팩토리 — `NewClient("replicaset-controller")`로 호출 |
+| `InformerFactory` | 공유 typed informer 팩토리 — RS·Pod informer를 여기서 꺼냄                       |
+| `ComponentConfig` | kube-controller-manager 전체 설정 — `ConcurrentRSSyncs` 등 컨트롤러별 값 보관      |
 
 * `ControllerContext`는 ReplicaSet, Deployment, DaemonSet, GC 등 kube-controller-manager 내 모든 컨트롤러가 공유하는 컨테이너임. 여기서는 ReplicaSet Controller가 실제로 사용하는 필드만 정리함.
 
@@ -374,11 +372,13 @@ func BuildControllers(ctx context.Context, controllerCtx ControllerContext,
 * `RequiresSpecialHandling` 또는 비활성화된 컨트롤러는 skip — `RequiresSpecialHandling = true`는 현재 SA Token Controller 하나뿐, 이 플래그로 2단계 순회 시 중복 빌드 방지
 * 빌드 결과 `Controller` 인터페이스를 `controllers` 슬라이스에 수집 → `RunControllers`에서 사용
 
-// @TODO: 여기부터
 > `cmd/kube-controller-manager/app/controller_descriptor.go:L93`
 
 ```go
 func (r *ControllerDescriptor) BuildController(ctx context.Context, controllerCtx ControllerContext) (Controller, error) {
+    logger := klog.FromContext(ctx)
+    controllerName := r.Name()
+
     // 요구 feature gate 비활성 시 nil 반환(skip)
     for _, featureGate := range r.GetRequiredFeatureGates() {
         if !utilfeature.DefaultFeatureGate.Enabled(featureGate) { return nil, nil }
@@ -386,6 +386,7 @@ func (r *ControllerDescriptor) BuildController(ctx context.Context, controllerCt
     // cloud provider controller skip
     if r.IsCloudProviderController() { return nil, nil }
 
+    ctx = klog.NewContext(ctx, klog.LoggerWithName(logger, controllerName))
     return r.GetControllerConstructor()(ctx, controllerCtx, controllerName)
 }
 ```
@@ -399,8 +400,11 @@ func (r *ControllerDescriptor) BuildController(ctx context.Context, controllerCt
 > `cmd/kube-controller-manager/app/apps.go:L102`
 
 ```go
-func newReplicaSetController(ctx context.Context, controllerContext ControllerContext, ...) (Controller, error) {
-    client, _ := controllerContext.NewClient("replicaset-controller")
+func newReplicaSetController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+    client, err := controllerContext.NewClient("replicaset-controller")
+    if err != nil {
+        return nil, err
+    }
     rsc := replicaset.NewReplicaSetController(
         ctx,
         controllerContext.InformerFactory.Apps().V1().ReplicaSets(),
@@ -415,26 +419,74 @@ func newReplicaSetController(ctx context.Context, controllerContext ControllerCo
 ```
 
 * InformerFactory에서 RS Informer, Pod Informer 주입
-* `rsc.Run`을 `controllerLoop`으로 감싸 `Controller` 인터페이스로 반환
+* `rsc.Run`을 `controllerLoop`으로 감싸 `Controller` 인터페이스로 반환 (`Name`, `Run` 메소드 구현)
 
 ### 4.3 NewReplicaSetController() / NewBaseController() — 구조체 생성
 
-> `pkg/controller/replicaset/replica_set.go:L155, L204`
+**`NewReplicaSetController()`**
 
-구조체 생성 시 핵심 필드 초기화:
+> `pkg/controller/replicaset/replica_set.go:L155`
 
-| 필드                       | 역할                                               |
-|--------------------------|--------------------------------------------------|
-| `kubeClient`             | Pod 생성/삭제 등 쓰기 시 API 서버 직접 호출                    |
-| `podControl`             | `kubeClient` 래퍼 — 테스트 시 mock 교체 가능, 이벤트 기록 일괄 처리 |
-| `expectations`           | 진행 중 작업 추적 — 캐시 갱신 전 중복 reconcile 방지             |
-| `queue`                  | `RateLimitingInterface` — 2절에서 설명한 WorkQueue     |
-| `burstReplicas`          | 한 번의 reconcile에서 최대 500 Pod 처리 (바깥 한계)           |
-| `rsLister` / `podLister` | 로컬 캐시(Indexer) 읽기 전용 — API 서버 호출 없이 메모리 즉시 조회    |
+```go
+func NewReplicaSetController(ctx context.Context, rsInformer appsinformers.ReplicaSetInformer,
+    podInformer coreinformers.PodInformer, kubeClient clientset.Interface, burstReplicas int) *ReplicaSetController {
+    eventBroadcaster := record.NewBroadcaster(record.WithContext(ctx))
+    // consistencyStore — StaleControllerConsistencyReplicaSet feature gate 분기 (생략)
+    return NewBaseController(logger, rsInformer, podInformer, kubeClient, burstReplicas,
+        apps.SchemeGroupVersion.WithKind("ReplicaSet"),
+        "replicaset_controller",
+        "replicaset",
+        controller.RealPodControl{
+            KubeClient: kubeClient,
+            Recorder:   eventBroadcaster.NewRecorder(...),
+            OnWrite:    podWriteCallback,
+        },
+        eventBroadcaster,
+        DefaultReplicaSetControllerFeatures(),
+        consistencyStore,
+    )
+}
+```
 
-* `rsLister` / `podLister`로 읽고, 쓰기(생성/삭제)는 반드시 `kubeClient`/`podControl`로 API 서버 직접 요청
+* ReplicaSet 전용 설정을 조립해서 `NewBaseController`로 위임하는 얇은 래퍼
+* `NewBaseController`는 ReplicationController(`replication.ReplicationManager`)와 공유하는 공통 구현 — GVK·metric 이름·queueName만 바꿔서 두 컨트롤러 모두 지원
+* `RealPodControl` — Pod 생성(`CreatePods`)/삭제(`DeletePod`) 실제 수행 구현체. `KubeClient`로 API 호출, `Recorder`로 이벤트 기록, `OnWrite` 콜백으로 쓰기 후 `consistencyStore` 갱신
+* `consistencyStore` — `StaleControllerConsistencyReplicaSet` feature gate 활성 시 Pod 쓰기의 ResourceVersion 추적 → Informer 캐시가 아직 반영하지 못한 stale 데이터 기반 Reconcile 방지
+* `eventBroadcaster` — 컨트롤러 이벤트(Pod 생성/삭제 성공·실패 등)를 API 서버에 기록하고 구조화 로깅
+
+**`NewBaseController()` — 구조체 초기화**
+
+> `pkg/controller/replicaset/replica_set.go:L204`
+
+```go
+rsc := &ReplicaSetController{
+    GroupVersionKind: gvk,
+    kubeClient:       kubeClient,
+    podControl:       podControl,
+    eventBroadcaster: eventBroadcaster,
+    burstReplicas:    burstReplicas,
+    expectations:     controller.NewUIDTrackingControllerExpectations(controller.NewControllerExpectations()),
+    queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+        workqueue.DefaultTypedControllerRateLimiter[string](),
+        workqueue.TypedRateLimitingQueueConfig[string]{Name: queueName},
+    ),
+    clock:              clock.RealClock{},
+    controllerFeatures: controllerFeatures,
+    consistencyStore:   consistencyStore,
+}
+```
+
+| 필드              | 역할                                                                        |
+|-----------------|---------------------------------------------------------------------------|
+| `kubeClient`    | Pod 생성/삭제 등 API 서버 직접 호출                                                  |
+| `podControl`    | `RealPodControl` — `kubeClient` 래퍼, 이벤트 기록 포함·테스트 시 mock 교체 가능            |
+| `burstReplicas` | 한 번의 Reconcile에서 최대 생성/삭제 수 (기본 500)                                      |
+| `expectations`  | `UIDTrackingControllerExpectations` — 진행 중 작업 추적, 캐시 갱신 전 중복 Reconcile 방지 |
+| `queue`         | `RateLimitingQueue` — RS 키 기반 작업 큐, 지수 백오프 재시도                            |
+
+* `rsLister`/`podLister`는 구조체 리터럴에 포함되지 않고, 아래 Informer 핸들러 등록 단계에서 별도 할당
 * `expectations` 상세:
-    * 문제: Pod 생성 요청 후 캐시 갱신 전에 Reconcile이 재트리거되면 중복 생성 위험
+    * 문제: Pod 생성 요청 후 Informer 캐시 갱신 전에 Reconcile이 재트리거되면 중복 생성 위험
     * 생성(add): 단순 카운터 — Pod Add 이벤트마다 1 차감
     * 삭제(del): UID 목록 추적 — 삭제 요청한 특정 Pod의 UID만 매칭 (단순 카운터면 다른 Pod 크래시가 잘못 차감 가능)
     * TTL: 응답 없어도 만료 후 Reconcile 재개 → 무한 블로킹 방지
@@ -442,43 +494,51 @@ func newReplicaSetController(ctx context.Context, controllerContext ControllerCo
     * `burstReplicas`: 한 번의 Reconcile에서의 최대 수 제한 (바깥 한계)
     * `slowStartBatch`: 그 안에서 1→2→4→8 배치로 점진적 생성 (안의 속도 조절) — 6절에서 상세 설명
 
-**핵심 와이어링**
-
-> `pkg/controller/replicaset/replica_set.go:L269`
-
-```go
-rsc.syncHandler = rsc.syncReplicaSet
-```
-
-* `processNextWorkItem`에서 `rsc.syncHandler`를 호출 → 실제 구현인 `syncReplicaSet`으로 연결
-
 **Informer 이벤트 핸들러 등록**
 
-> `pkg/controller/replicaset/replica_set.go:L207, L223~233, L251~264`
+> `pkg/controller/replicaset/replica_set.go:L223~249`
 
 ```go
-rsc := &ReplicaSetController{ ... }
-
 rsInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
     AddFunc:    func(obj interface{}) { rsc.addRS(logger, obj) },
     UpdateFunc: func(oldObj, newObj interface{}) { rsc.updateRS(logger, oldObj, newObj) },
     DeleteFunc: func(obj interface{}) { rsc.deleteRS(logger, obj) },
 })
+rsInformer.Informer().AddIndexers(cache.Indexers{
+    controllerUIDIndex: func(obj interface{}) ([]string, error) {
+        controllerRef := metav1.GetControllerOf(obj.(*apps.ReplicaSet))
+        if controllerRef == nil { return []string{}, nil }
+        return []string{string(controllerRef.UID)}, nil
+    },
+})
+rsc.rsIndexer = rsInformer.Informer().GetIndexer()
+rsc.rsLister = rsInformer.Lister()
+rsc.rsListerSynced = rsInformer.Informer().HasSynced
+```
 
+> `pkg/controller/replicaset/replica_set.go:L251~268`
+
+```go
 podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
     AddFunc:    func(obj interface{}) { rsc.addPod(logger, obj) },
     UpdateFunc: func(oldObj, newObj interface{}) { rsc.updatePod(logger, oldObj, newObj) },
     DeleteFunc: func(obj interface{}) { rsc.deletePod(logger, obj) },
 })
+rsc.podLister = podInformer.Lister()
+rsc.podListerSynced = podInformer.Informer().HasSynced
+controller.AddPodControllerIndexer(podInformer.Informer())
+rsc.podIndexer = podInformer.Informer().GetIndexer()
 ```
 
-* RS Informer와 Pod Informer 모두 이 큐에 **RS 키**를 삽입 — Reconcile 단위는 항상 RS
-* RS Informer EventHandler: RS 키를 queue에 삽입 → 비동기 처리
-* Pod Informer EventHandler: expectations 업데이트(즉시) + Pod의 owner RS 키를 queue에 삽입
+* RS/Pod Informer 모두 큐에 **RS 키**를 삽입 — Reconcile 단위는 항상 RS
+* `controllerUIDIndex` — RS의 ownerReference(Deployment) UID로 인덱싱. `getReplicaSetsWithSameController`에서 같은 Deployment 아래 형제 RS를 빠르게 조회 (삭제 대상 선정 시 사용)
+* `AddPodControllerIndexer` — Pod의 namespace + ownerReference UID로 인덱싱. `FilterPodsByOwner`에서 RS가 소유한 Pod 및 고아 Pod를 효율적으로 조회
+* `rsLister`/`podLister` — 로컬 캐시 읽기 전용 뷰 (API 서버 호출 없이 메모리 즉시 조회)
+* `rsListerSynced`/`podListerSynced` — `Run()`에서 캐시 동기화 완료 대기 시 사용 (4.4에서 상세)
 
 ##### 유틸 함수: `enqueueRS`
 
-> `pkg/controller/replicaset/replica_set.go:L367~375`
+> `pkg/controller/replicaset/replica_set.go:L367`
 
 ```go
 func (rsc *ReplicaSetController) enqueueRS(rs *apps.ReplicaSet) {
@@ -488,26 +548,16 @@ func (rsc *ReplicaSetController) enqueueRS(rs *apps.ReplicaSet) {
 }
 ```
 
-* RS 오브젝트 → 키 추출 → `queue.Add(key)` 래퍼
+* RS 오브젝트 → `namespace/name` 키 추출 → `queue.Add(key)` 래퍼
 * 코드에서 `enqueueRS(rs)`와 `queue.Add(rsKey)` 혼용
     * 입력이 RS 오브젝트면 `enqueueRS`, 키를 이미 갖고 있으면 `queue.Add` 직접 호출
     * 결과는 동일
 
 ##### RS Informer 핸들러
 
-> `pkg/controller/replicaset/replica_set.go:L223~233`
-
-```go
-rsInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-    AddFunc:    func(obj interface{}) { rsc.addRS(logger, obj) },
-    UpdateFunc: func(oldObj, newObj interface{}) { rsc.updateRS(logger, oldObj, newObj) },
-    DeleteFunc: func(obj interface{}) { rsc.deleteRS(logger, obj) },
-})
-```
-
 **`addRS()`**
 
-> `pkg/controller/replicaset/replica_set.go:L387~391`
+> `pkg/controller/replicaset/replica_set.go:L387`
 
 ```go
 func (rsc *ReplicaSetController) addRS(logger klog.Logger, obj interface{}) {
@@ -520,7 +570,7 @@ func (rsc *ReplicaSetController) addRS(logger klog.Logger, obj interface{}) {
 
 **`updateRS()`**
 
-> `pkg/controller/replicaset/replica_set.go:L399~409, L426`
+> `pkg/controller/replicaset/replica_set.go:L394`
 
 ```go
 if curRS.UID != oldRS.UID {
@@ -541,7 +591,7 @@ rsc.enqueueRS(curRS)
 
 **`deleteRS()`**
 
-> `pkg/controller/replicaset/replica_set.go:L429~459`
+> `pkg/controller/replicaset/replica_set.go:L429`
 
 ```go
 // tombstone 처리 — k8s 컨트롤러 Delete 핸들러 표준 패턴
@@ -554,6 +604,7 @@ if !ok {
 }
 
 // ...
+rsc.consistencyStore.Clear(types.NamespacedName{Namespace: rs.Namespace, Name: rs.Name}, rs.UID)
 rsc.expectations.DeleteExpectations(logger, key)
 rsc.queue.Add(key)
 ```
@@ -566,24 +617,15 @@ rsc.queue.Add(key)
     * Relist로 받은 새 목록에 해당 키 없음 → DeltaFIFO가 "삭제됐음"을 추론
     * 마지막으로 알려진(stale할 수 있는) 오브젝트를 `DeletedFinalStateUnknown{Key, Obj}`로 감싸 전달
     * 정의: `staging/src/k8s.io/client-go/tools/cache/delta_fifo.go:L793~800`
+* `consistencyStore.Clear(...)` — 삭제된 RS의 일관성 추적 데이터 제거
 * `expectations.DeleteExpectations(key)` — 해당 RS의 expectations 전부 삭제
 * `queue.Add(key)` — Reconcile 기회 부여 (이미 삭제됐으면 즉시 종료)
 
 ##### Pod Informer 핸들러
 
-> `pkg/controller/replicaset/replica_set.go:L251~264`
-
-```go
-podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-    AddFunc:    func(obj interface{}) { rsc.addPod(logger, obj) },
-    UpdateFunc: func(oldObj, newObj interface{}) { rsc.updatePod(logger, oldObj, newObj) },
-    DeleteFunc: func(obj interface{}) { rsc.deletePod(logger, obj) },
-})
-```
-
 **`addPod()`**
 
-> `pkg/controller/replicaset/replica_set.go:L466~501`
+> `pkg/controller/replicaset/replica_set.go:L463`
 
 ```go
 if pod.DeletionTimestamp != nil {
@@ -613,9 +655,16 @@ for _, rs := range rss {
 
 **`deletePod()`**
 
-> `pkg/controller/replicaset/replica_set.go:L601~617`
+> `pkg/controller/replicaset/replica_set.go:L581`
 
 ```go
+// tombstone 처리 (addRS와 동일 패턴)
+pod, ok := obj.(*v1.Pod)
+if !ok {
+    tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+    pod, ok = tombstone.Obj.(*v1.Pod)
+}
+
 controllerRef := metav1.GetControllerOf(pod)
 if controllerRef == nil {
     return  // 고아 Pod 무시
@@ -626,13 +675,13 @@ rsc.queue.Add(rsKey)
 ```
 
 * ControllerRef 없는 고아 Pod → 무시
+* tombstone 처리 — Delete 이벤트 유실 시에도 처리 가능 (RS Informer와 동일 패턴)
 * `expectations.DeletionObserved(rsKey, podUID)` — del expectations에서 해당 UID 제거 (즉시)
 * owner RS 키를 queue에 삽입
-* Delete 이벤트 유실 시 tombstone(`DeletedFinalStateUnknown`) 처리 포함
 
 **`updatePod()`**
 
-> `pkg/controller/replicaset/replica_set.go:L509~577`
+> `pkg/controller/replicaset/replica_set.go:L506`
 
 ```go
 if curPod.ResourceVersion == oldPod.ResourceVersion { return }
@@ -665,6 +714,19 @@ if labelChanged || controllerRefChanged {
 * **ControllerRef 변경됨** → 이전 owner RS도 enqueue (소유권 이전 시 양쪽 RS Reconcile)
 * **ControllerRef 있음** (일반) → owner RS enqueue
 * **고아 Pod의 레이블/ControllerRef 변경** → 매칭 RS 전부 enqueue (입양 가능성 확인)
+
+**syncHandler 와이어링**
+
+> `pkg/controller/replicaset/replica_set.go:L269`
+
+```go
+rsc.syncHandler = rsc.syncReplicaSet
+
+return rsc
+```
+
+* `processNextWorkItem`에서 `rsc.syncHandler` 호출 → 실제 구현 `syncReplicaSet`으로 연결
+* `return rsc` — 완성된 `*ReplicaSetController` 반환 → `newReplicaSetController`(4.2)에서 `controllerLoop`으로 감싸 `Controller` 인터페이스로 반환 → `RunControllers`에서 고루틴 시작 → `rsc.Run(ctx, workers)` 호출 — 4.4로 이어짐
 
 ### 4.4 Run() — 워커 시작
 
