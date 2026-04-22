@@ -872,6 +872,8 @@ func (rsc *ReplicaSetController) processNextWorkItem(ctx context.Context) bool {
 // pkg/controller/replicaset/replica_set.go:L755
 syncReplicaSet(key)
   │
+  ├─ consistencyStore.EnsureReady — 캐시가 이전 쓰기를 따라잡았는지 검증
+  │
   ├─ ReplicaSet 조회 (rsLister)
   ├─ 해당 RS 소유 Pod 목록 수집 (getPodsForReplicaSet)
   ├─ active / terminating Pod 분리
@@ -891,18 +893,28 @@ syncReplicaSet(key)
 
 #### 1단계 — RS 조회
 
-> `pkg/controller/replicaset/replica_set.go:L778~787`
+> `pkg/controller/replicaset/replica_set.go:L767~787`
 
 ```go
+if err := rsc.consistencyStore.EnsureReady(rsNamespacedName); err != nil {
+    return err  // 캐시가 이전 쓰기를 아직 반영 못 함 → 재큐잉
+}
+
 rs, err := rsc.rsLister.ReplicaSets(namespace).Get(name)
 if apierrors.IsNotFound(err) {
+    rsc.consistencyStore.Clear(rsNamespacedName, "")
     rsc.expectations.DeleteExpectations(logger, key)
     return nil
 }
 ```
 
+* `consistencyStore.EnsureReady(owner)` — 이전 Reconcile에서 API 서버에 쓴 ResourceVersion을 Informer 캐시가 따라잡았는지 검증
+    * 미준비 시 `error` 반환 → worker가 `AddRateLimited`로 재큐잉 → 캐시 동기화 후 재처리
+    * stale 캐시 기반으로 잘못된 diff 계산 방지 (예: 방금 생성한 Pod가 캐시에 아직 없어 중복 생성)
 * 로컬 캐시에서 RS 조회 — API 서버 호출 없음
-* `IsNotFound` → RS 이미 삭제됨 → expectations 정리 후 정상 종료
+* `IsNotFound` → RS 이미 삭제됨 → `consistencyStore.Clear` + expectations 정리 후 정상 종료
+    * `Clear(owner, "")` — UID 빈 문자열 = 무조건 삭제. `deleteRS`의 `Clear(owner, rs.UID)`(UID 매칭)와 다름
+    * deleteRS 핸들러가 먼저 처리하면 이미 제거됨 → 여기서는 deleteRS 미호출 시 대비하는 방어 경로
     * `nil` 반환으로 worker가 `queue.Forget(key)` 호출 → 재시도 카운터 초기화 (4.5 참조)
 * 조회한 RS는 "Informer가 마지막으로 수신한 스냅샷" — 실제 현재 상태와 약간의 차이 가능
 
@@ -920,15 +932,24 @@ allTerminatingPods := controller.FilterTerminatingPods(allRSPods)
 terminatingPods := controller.FilterClaimedPods(rs, selector, allTerminatingPods)
 ```
 
-* `FilterPodsByOwner`: RS UID로 인덱싱된 Pod + 셀렉터 매칭 고아 Pod 전부 수집
-* `FilterActivePods`: Succeeded / Failed / 이미 삭제된 Pod 제외 → Active Pod만 추출
-* `claimPods`: Active Pod 중 셀렉터 매칭 확인 → 고아 Pod 입양 → 최종 `activePods` 반환
-    * 입양 성공한 고아 Pod도 `activePods`에 포함 → 이후 diff 계산에 반영
-
-**Terminating Pod 분리** (feature gate `DeploymentReplicaSetTerminatingReplicas`)
-* `DeletionTimestamp` 설정된 Pod를 Active에서 분리
-* `manageReplicas`의 active 카운트에 포함 안 됨 → Terminating Pod를 active로 보면 diff = 0으로 판단해 대체 Pod 생성 안 됨 → 분리함으로써 즉시 대체 Pod 생성 가능
-* status 계산에는 별도로 전달 → `TerminatingReplicas` 필드 반영
+* `FilterPodsByOwner`: 이 RS 소유 Pod 전체 + 네임스페이스 내 고아 Pod 전체 수집
+    * 고아 Pod = ownerRef가 없는 Pod — UID와 무관하게 네임스페이스 단위로 전부 반환
+    * 셀렉터 매칭은 이후 `claimPods`에서 수행 — 여기서는 후보군만 수집
+* `FilterActivePods`: `Succeeded` / `Failed` / `DeletionTimestamp` 설정된 Pod 제외 → Active Pod만 추출
+    * Active = `Phase`가 `Running` / `Pending` / `Unknown`이고 삭제 요청 없는 Pod
+    * "이미 삭제된 Pod"는 캐시에 존재하지 않음 — `DeletionTimestamp != nil`은 삭제 요청됐지만 kubelet이 아직 종료 처리 중인 Pod
+* `claimPods`: 각 Pod의 ownerRef 상태에 따라 분류 → **API 서버 PATCH**로 입양/방출 수행 → 이 RS가 책임질 Pod만 반환
+    * **이 RS 소유 Pod** (`ownerRef.UID == rs.UID`): 셀렉터 매칭 → 유지 / 셀렉터 불일치 + RS 미삭제 → ownerRef 제거 PATCH (방출) / 셀렉터 불일치 + RS 삭제 중 → 방출 건너뜀
+    * **다른 컨트롤러 소유 Pod**: 무시
+    * **고아 Pod** (ownerRef 없음): 셀렉터 매칭 + RS 미삭제 + Pod 미삭제 → ownerRef 추가 PATCH (입양) / 조건 불일치 → 무시
+    * 입양 성공한 고아 Pod도 반환값에 포함 → 이후 diff 계산에 반영
+    * 분류만 하는 것이 아니라 실제 etcd 쓰기 발생 — 2단계(Pod 목록 수집 & 분류)에서 이미 상태 변경 가능
+* **Terminating Pod** — `DeletionTimestamp != nil` + Phase가 `Succeeded`/`Failed` 아닌 Pod (삭제 요청됐지만 kubelet이 아직 종료 처리 중)
+    * `IsPodActive`가 `DeletionTimestamp != nil`을 항상 제외 → feature gate와 무관하게 `activePods`에 포함되지 않음 → diff 계산에서 빠지므로 대체 Pod 즉시 생성
+    * **RS Reconcile 핵심 동작(diff 계산 → Pod 생성/삭제)에는 영향 없음** — `activePods`만 사용
+    * feature gate `DeploymentReplicaSetTerminatingReplicas`: Terminating Pod를 별도 수집하여 `calculateStatus`에 전달 → RS status의 `TerminatingReplicas` 필드에 count 노출
+        * RS 입장에서는 메타데이터 수집 및 노출이 전부
+        * Deployment 컨트롤러 등 상위 컨트롤러가 이 필드를 읽어 "현재 몇 개가 종료 중"인지 파악 → 롤링 업데이트 중 과도한 Pod 생성 방지 등 정밀한 판단에 활용
 
 #### 3단계 — expectations 확인 & manageReplicas 호출 조건
 
@@ -989,22 +1010,35 @@ for i := 0; i < diff-successfulCreations; i++ {
 diff = min(diff, rsc.burstReplicas)
 podsToDelete := getPodsToDelete(activePods, relatedPods, diff)
 rsc.expectations.ExpectDeletions(logger, rsKey, getPodKeys(podsToDelete))
+errCh := make(chan error, diff)
 var wg sync.WaitGroup
 wg.Add(diff)
 for _, pod := range podsToDelete {
     go func(targetPod *v1.Pod) {
         defer wg.Done()
         if err := rsc.podControl.DeletePod(...); err != nil {
-            rsc.expectations.DeletionObserved(logger, rsKey, podKey)  // 실패 시 즉시 차감
+            podKey := controller.PodKey(targetPod)
+            rsc.expectations.DeletionObserved(logger, rsKey, podKey)
+            if !apierrors.IsNotFound(err) {
+                errCh <- err
+            }
         }
     }(pod)
 }
 wg.Wait()
+
+select {
+case err := <-errCh:
+    if err != nil { return err }
+default:
+}
 ```
 
 * `ExpectDeletions` **먼저** 등록 (UID 목록) → Pod Delete 이벤트가 차감
 * 삭제는 **병렬 goroutine** — 각 삭제 독립적, 실패해도 다른 삭제에 영향 없음
 * 삭제 API 실패 시 즉시 차감 → 다음 Reconcile에서 재시도
+* `IsNotFound` 오류 → `DeletionObserved`만 호출, `errCh`에 전파 안 함 — Pod가 이미 삭제된 상태이므로 성공으로 처리
+* `errCh`: 실제 오류만 수집 → `wg.Wait()` 후 첫 번째 오류만 반환 — 오류가 대체로 동일(예: API 서버 불가)하므로 하나만 보고
 
 **생성 vs 삭제 비대칭 설계**
 
@@ -1015,17 +1049,25 @@ wg.Wait()
 
 #### 5단계 — 상태 업데이트
 
-> `pkg/controller/replicaset/replica_set.go:L824~831`
+> `pkg/controller/replicaset/replica_set.go:L821~841`
 
 ```go
+rs = rs.DeepCopy()
 newStatus := calculateStatus(rs, activePods, terminatingPods, manageReplicasErr, ...)
-updatedRS, err := updateReplicaSetStatus(logger, rsc.kubeClient.AppsV1().ReplicaSets(rs.Namespace), rs, newStatus, ...)
+updatedRS, err := updateReplicaSetStatus(...)
+if err != nil { return err }
+
+rsc.consistencyStore.WroteAt(rsNamespacedName, rs.UID, replicaSetGroupResource, updatedRS.ResourceVersion)
+if manageReplicasErr != nil { return manageReplicasErr }
 ```
 
 * `manageReplicas` 오류 여부와 무관하게 **항상** 상태 업데이트 실행
+* `rs.DeepCopy()` — Informer 캐시 원본 보호. status 필드 수정이 캐시를 오염시키지 않도록 복사본 사용
 * `calculateStatus`: `ReadyReplicas`, `AvailableReplicas`, `TerminatingReplicas` 등 계산
 * `updateReplicaSetStatus`: API 서버에 status 패치 (로컬 캐시가 아닌 실제 저장)
-* 오류 순서: 상태 업데이트 오류 → 즉시 반환 / `manageReplicas` 오류 → 상태 업데이트 후 반환
+* `consistencyStore.WroteAt(...)` — status 패치로 변경된 ResourceVersion 기록 → 다음 Reconcile의 `EnsureReady`가 이 버전 이상을 요구
+    * 1단계의 `EnsureReady`와 쌍을 이루는 메서드 — WroteAt이 기록한 RV를 EnsureReady가 검증
+* 오류 반환 순서: (1) status 패치 오류 → `WroteAt` 호출 없이 즉시 반환 (2) `manageReplicas` 오류 → status 패치 + `WroteAt` 후 반환
 
 #### 6단계 — MinReadySeconds 재동기화 예약
 
@@ -1034,7 +1076,12 @@ updatedRS, err := updateReplicaSetStatus(logger, rsc.kubeClient.AppsV1().Replica
 ```go
 if updatedRS.Spec.MinReadySeconds > 0 &&
     updatedRS.Status.ReadyReplicas != updatedRS.Status.AvailableReplicas {
-    nextSyncDuration = ...
+    nextSyncDuration = ptr.To(time.Duration(updatedRS.Spec.MinReadySeconds) * time.Second)
+    if nextCheck := controller.FindMinNextPodAvailabilityCheck(activePods, updatedRS.Spec.MinReadySeconds, now, rsc.clock); nextCheck != nil {
+        nextSyncDuration = nextCheck
+    }
+}
+if nextSyncDuration != nil {
     rsc.queue.AddAfter(key, *nextSyncDuration)
 }
 ```
@@ -1042,6 +1089,9 @@ if updatedRS.Spec.MinReadySeconds > 0 &&
 * `MinReadySeconds`: Pod가 Ready 상태로 N초 유지돼야 Available로 간주
 * Ready지만 아직 Available 아닌 Pod 존재 → N초 후 재동기화 예약
 * 예약 없으면 Available 전환 시 Informer 이벤트가 없어 status 업데이트 누락 가능
+* `nextSyncDuration` 기본값: `MinReadySeconds * time.Second` — 최악 케이스 fallback
+* `FindMinNextPodAvailabilityCheck`: 각 active Pod의 Ready 전환 시점 기준으로 Available까지 남은 최소 시간 계산 → 더 정밀한 재동기화 타이밍
+    * 값을 반환하면 기본값 오버라이드 — Ready 전환 후 이미 경과한 시간을 반영하므로 기본값보다 짧거나 같음
 
 ---
 
