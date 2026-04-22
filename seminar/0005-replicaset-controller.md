@@ -1028,7 +1028,9 @@ if skippedPods := diff - successfulCreations; skippedPods > 0 {
 > `pkg/controller/replicaset/replica_set.go:L700~747`
 
 ```go
-diff = min(diff, rsc.burstReplicas)
+if diff > rsc.burstReplicas {
+    diff = rsc.burstReplicas
+}
 podsToDelete := getPodsToDelete(activePods, relatedPods, diff)
 rsc.expectations.ExpectDeletions(logger, rsKey, getPodKeys(podsToDelete))
 errCh := make(chan error, diff)
@@ -1056,17 +1058,28 @@ default:
 ```
 
 * `ExpectDeletions` **먼저** 등록 (UID 목록) → Pod Delete 이벤트가 차감
+* `getPodsToDelete`: 우선순위 정렬 후 앞에서 `diff`개 선정 (`ActivePodsWithRanks.Less` 기준)
+    1. 노드 미배정 Pod (`Spec.NodeName == ""`)
+    2. Phase 순: Pending < Unknown < Running
+    3. Not Ready < Ready
+    4. `pod-deletion-cost` 어노테이션 낮은 Pod (feature gate `PodDeletionCost`)
+    5. 같은 노드에 관련 Pod가 많이 몰린 Pod — `relatedPods`(같은 owner의 다른 RS Pod 포함)로 노드별 분포 계산, 분산 유지
+    6. Ready 시간이 짧은 Pod (막 Ready된 Pod 먼저)
+    7. 재시작 횟수가 많은 Pod
+    8. 생성 시간이 짧은 Pod (최근에 만들어진 Pod 먼저)
 * 삭제는 **병렬 goroutine** — 각 삭제 독립적, 실패해도 다른 삭제에 영향 없음
-* 삭제 API 실패 시 즉시 차감 → 다음 Reconcile에서 재시도
-* `IsNotFound` 오류 → `DeletionObserved`만 호출, `errCh`에 전파 안 함 — Pod가 이미 삭제된 상태이므로 성공으로 처리
+* 삭제 API 실패 시 `DeletionObserved` 즉시 호출 (에러 종류 무관)
+    * `err != nil` = 이 호출로 인한 실제 삭제 없음 → Informer Delete 이벤트 없음 → 수동 차감 필요
+* `IsNotFound` 이외의 오류 → `errCh` 전파 → 다음 Reconcile에서 재시도
+* `IsNotFound` 오류 → `errCh` 전파 안 함 — Pod가 이미 삭제된 상태이므로 목표 달성, 재시도 불필요
 * `errCh`: 실제 오류만 수집 → `wg.Wait()` 후 첫 번째 오류만 반환 — 오류가 대체로 동일(예: API 서버 불가)하므로 하나만 보고
 
 **생성 vs 삭제 비대칭 설계**
 
-|       | 생성                                       | 삭제                       |
-|-------|------------------------------------------|--------------------------|
-| 실행 방식 | `slowStartBatch` — 순차 배치, 오류 시 중단        | 병렬 goroutine, 오류 시 개별 처리 |
-| 이유    | 실패 원인(쿼터 부족 등)이 동일 → 전부 시도 전에 빠르게 중단이 유리 | 실패가 독립적 → 병렬 처리로 지연 없음   |
+|       | 생성                                           | 삭제                       |
+|-------|----------------------------------------------|--------------------------|
+| 실행 방식 | `slowStartBatch` — 배치 크기를 배로 늘리며 실행, 오류 시 중단 | 병렬 goroutine, 오류 시 개별 처리 |
+| 이유    | 실패 원인(쿼터 부족 등)이 동일 → 전부 시도 전에 빠르게 중단이 유리     | 실패가 독립적 → 병렬 처리로 지연 없음   |
 
 #### 5단계 — 상태 업데이트
 
@@ -1078,17 +1091,36 @@ newStatus := calculateStatus(rs, activePods, terminatingPods, manageReplicasErr,
 updatedRS, err := updateReplicaSetStatus(...)
 if err != nil { return err }
 
-rsc.consistencyStore.WroteAt(rsNamespacedName, rs.UID, replicaSetGroupResource, updatedRS.ResourceVersion)
+rsc.consistencyStore.WroteAt(
+    types.NamespacedName{Name: rs.Name, Namespace: rs.Namespace},
+    rs.UID,
+    replicaSetGroupResource,
+    updatedRS.ResourceVersion,
+)
 if manageReplicasErr != nil { return manageReplicasErr }
 ```
 
 * `manageReplicas` 오류 여부와 무관하게 **항상** 상태 업데이트 실행
 * `rs.DeepCopy()` — Informer 캐시 원본 보호. status 필드 수정이 캐시를 오염시키지 않도록 복사본 사용
-* `calculateStatus`: `ReadyReplicas`, `AvailableReplicas`, `TerminatingReplicas` 등 계산
+    * `updateReplicaSetStatus` 내부에서 `rs.Status = newStatus`로 객체를 직접 수정 → 캐시 포인터 그대로 넘기면 공유 캐시 오염
+* `calculateStatus`: activePods/terminatingPods를 순회하며 status 필드 계산
+    * `Replicas` = `len(activePods)`
+    * `FullyLabeledReplicas` = activePods 중 `rs.Spec.Template.Labels`와 완전히 매칭되는 수
+    * `ReadyReplicas` = activePods 중 `IsPodReady` 통과 수
+    * `AvailableReplicas` = Ready Pod 중 `IsPodAvailable(pod, minReadySeconds, now)` 통과 수 — Ready 후 `MinReadySeconds`가 지난 Pod만 포함
+    * `TerminatingReplicas` = `len(terminatingPods)` (feature gate `DeploymentReplicaSetTerminatingReplicas` + `EnableStatusTerminatingReplicas` 조건)
+    * `ReplicaSetReplicaFailure` Condition: `manageReplicasErr != nil`이고 기존 Condition 없으면 설정 (`FailedCreate`/`FailedDelete`), `manageReplicasErr == nil`이고 기존 Condition 있으면 제거
 * `updateReplicaSetStatus`: API 서버에 status 패치 (로컬 캐시가 아닌 실제 저장)
 * `consistencyStore.WroteAt(...)` — status 패치로 변경된 ResourceVersion 기록 → 다음 Reconcile의 `EnsureReady`가 이 버전 이상을 요구
-    * 1단계의 `EnsureReady`와 쌍을 이루는 메서드 — WroteAt이 기록한 RV를 EnsureReady가 검증
-* 오류 반환 순서: (1) status 패치 오류 → `WroteAt` 호출 없이 즉시 반환 (2) `manageReplicas` 오류 → status 패치 + `WroteAt` 후 반환
+    * 1단계의 `EnsureReady`와 쌍을 이루는 메서드 — WroteAt이 기록한 ResourceVersion를 EnsureReady가 검증
+* 오류 반환 순서 — 실행 순서(`manageReplicas` → `updateReplicaSetStatus`)와 반대
+    * status 패치 오류 → `WroteAt` 호출 없이 즉시 반환 (먼저 반환)
+        * status가 실제로 저장되지 않았으므로 ResourceVersion 변경 없음 → `WroteAt` 기록 의미 없음
+        * `manageReplicasErr`보다 우선 반환 — 더 치명적, 이 상태로 재시도하면 정확한 상태 기반 불가
+    * `manageReplicas` 오류 → status 패치 + `WroteAt` 완료 후 반환 (나중에 반환)
+        * status는 "의도한 상태"가 아닌 **"현재 실제 상태"** 를 기록 — 생성/삭제 실패와 무관하게 지금 존재하는 Pod 수가 정확히 반영됨
+        * `calculateStatus`에 `manageReplicasErr`를 넘겨 `ReplicaSetReplicaFailure` Condition도 함께 저장 → status 패치 내용 자체는 정확
+        * 다음 Reconcile에서 "현재 Pod 수 + 이전 실패 여부"를 정확한 기반으로 재시도 가능
 
 #### 6단계 — MinReadySeconds 재동기화 예약
 
