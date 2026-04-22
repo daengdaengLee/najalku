@@ -772,12 +772,29 @@ return rsc
 
 ### 4.4 Run() — 워커 시작
 
+4.2의 `newReplicaSetController`에서 `rsc.Run`을 `controllerLoop`으로 감싸 `Controller` 인터페이스(`Name()`, `Run(ctx)`)로 반환. 실행 시점 호출 체인:
+
+1. `RunControllers` (`controllermanager.go:L655`) — `controllers` 슬라이스 순회, 각 `controller.Run(ctx)`를 별도 고루틴으로 실행
+2. `controllerLoop.Run(ctx)` (`controller_utils.go:L65`) — 저장된 함수 포인터 호출
+3. 함수 포인터 = `newReplicaSetController`에서 등록한 클로저: `rsc.Run(ctx, ConcurrentRSSyncs)` (`apps.go:L415~417`)
+
+함수 포인터 → `controllerLoop` 구조체 → `Controller` 인터페이스 → `RunControllers` 고루틴 실행이라는 간접 호출 구조. 실제 진입점은 아래 `Run()` 함수.
+
 > `pkg/controller/replicaset/replica_set.go:L275`
 
 ```go
 func (rsc *ReplicaSetController) Run(ctx context.Context, workers int) {
+    defer utilruntime.HandleCrash()
+
     rsc.eventBroadcaster.StartStructuredLogging(3)
     rsc.eventBroadcaster.StartRecordingToSink(...)
+    defer rsc.eventBroadcaster.Shutdown()
+
+    var wg sync.WaitGroup
+    defer func() {
+        rsc.queue.ShutDown()
+        wg.Wait()
+    }()
 
     if !cache.WaitForNamedCacheSyncWithContext(ctx, rsc.podListerSynced, rsc.rsListerSynced) {
         return
@@ -792,9 +809,12 @@ func (rsc *ReplicaSetController) Run(ctx context.Context, workers int) {
 }
 ```
 
-* 이벤트 브로드캐스터 시작
+* `defer HandleCrash()` — 패닉 발생 시 로깅 후 복구, 프로세스 전체 종료 방지
+* 이벤트 브로드캐스터 시작 + `defer Shutdown()` — 종료 시 이벤트 파이프라인 정리
+* **종료 시 정리 흐름**: `<-ctx.Done()` → defer 실행 → `queue.ShutDown()` (큐 닫아 워커의 `Get()` 즉시 반환) → `wg.Wait()` (모든 워커 종료 대기) → `eventBroadcaster.Shutdown()`
 * `WaitForNamedCacheSyncWithContext` — RS/Pod Informer 캐시가 모두 동기화될 때까지 블로킹
     * 캐시 미동기화 상태에서 Reconcile 시작 시 stale 데이터로 잘못된 Pod 수 계산 위험
+    * `false` 반환 시 early return — 두 가지 경우: ① List/Watch 오류 등으로 캐시 동기화 실패, ② 동기화 대기 중 ctx 취소(셧다운 시그널). 워커 고루틴 시작 전이므로 defer의 `wg.Wait()`는 즉시 반환
 * `workers`(기본값: `ConcurrentRSSyncs`) 개의 고루틴 시작
     * `wait.UntilWithContext(rsc.worker, 1s)` — worker 패닉/종료 시 1초 후 자동 재시작
 
@@ -818,16 +838,19 @@ func (rsc *ReplicaSetController) processNextWorkItem(ctx context.Context) bool {
         rsc.queue.Forget(key)          // 성공: rate limiter 초기화
         return true
     }
+    utilruntime.HandleError(fmt.Errorf("sync %q failed with %v", key, err))
     rsc.queue.AddRateLimited(key)      // 실패: 지수 백오프 후 재삽입
     return true
 }
 ```
 
 * `worker`: `processNextWorkItem()`을 큐 종료 시까지 무한 반복
-* `queue.Get()` — 항목이 없으면 블로킹, 있으면 즉시 반환
+    * 소스 주석: "syncHandler is never invoked concurrently with the same key" — `queue.Get()`이 같은 key를 `Done()` 전까지 다시 내보내지 않아 동일 RS에 대한 동시 Reconcile 방지
+* `queue.Get()` — 항목이 없으면 블로킹, 있으면 즉시 반환. `ShutDown()` 호출 시 `quit = true` 반환 → `false` 리턴 → worker 루프 종료
+* `defer queue.Done(key)` — "이 key 처리 완료" 표시. `Done()` 호출 전까지 같은 key가 다시 `Get()`으로 나오지 않음
 * `rsc.syncHandler` = `rsc.syncReplicaSet` (4.3의 와이어링) → 다음 섹션으로 연결
-
----
+* 성공 시 `queue.Forget(key)` — 이전 실패로 쌓인 retry 횟수·백오프 기록 리셋. 다음 enqueue 시 즉시 처리
+* 실패 시 `HandleError` 로깅 + `queue.AddRateLimited(key)` — rate limiter가 지수 백오프 간격 후 재삽입
 
 ## 5. `syncReplicaSet()` — Reconcile 루프
 
