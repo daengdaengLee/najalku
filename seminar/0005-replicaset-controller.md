@@ -847,10 +847,20 @@ func (rsc *ReplicaSetController) processNextWorkItem(ctx context.Context) bool {
 * `worker`: `processNextWorkItem()`을 큐 종료 시까지 무한 반복
     * 소스 주석: "syncHandler is never invoked concurrently with the same key" — `queue.Get()`이 같은 key를 `Done()` 전까지 다시 내보내지 않아 동일 RS에 대한 동시 Reconcile 방지
 * `queue.Get()` — 항목이 없으면 블로킹, 있으면 즉시 반환. `ShutDown()` 호출 시 `quit = true` 반환 → `false` 리턴 → worker 루프 종료
-* `defer queue.Done(key)` — "이 key 처리 완료" 표시. `Done()` 호출 전까지 같은 key가 다시 `Get()`으로 나오지 않음
 * `rsc.syncHandler` = `rsc.syncReplicaSet` (4.3의 와이어링) → 다음 섹션으로 연결
-* 성공 시 `queue.Forget(key)` — 이전 실패로 쌓인 retry 횟수·백오프 기록 리셋. 다음 enqueue 시 즉시 처리
-* 실패 시 `HandleError` 로깅 + `queue.AddRateLimited(key)` — rate limiter가 지수 백오프 간격 후 재삽입
+* **WorkQueue 2레이어 구조** — `RateLimitingInterface`는 두 개의 독립된 상태 관리:
+
+| 레이어          | 관련 메서드                               | 추적 내용                             |
+|--------------|--------------------------------------|-----------------------------------|
+| Base Queue   | `Get()`, `Done(key)`                 | 현재 처리 중인 키 (`processing` 집합)      |
+| Rate Limiter | `AddRateLimited(key)`, `Forget(key)` | 키별 실패 횟수 (`failures map[key]int`) |
+
+* `defer queue.Done(key)` — Base Queue 레이어: "이 key 처리 완료" 표시. `Done()` 호출 전까지 같은 key가 다시 `Get()`으로 나오지 않음
+    * `Done`과 `Forget`은 완전히 다른 레이어 — `Forget`만 호출하고 `Done` 생략 시 해당 키가 `processing`에 남아 큐에서 재처리 불가
+* 성공 시 `queue.Forget(key)` — Rate Limiter 레이어: `delete(failures, key)`. 큐에서 제거하는 게 아니라 실패 카운터만 삭제
+    * `Forget` 없이 성공하면 `failures` 맵에 이전 실패 횟수가 남음 → 다음 실패 시 누적된 backoff 적용
+    * `Forget` 호출 → 카운터 초기화 → 다음 실패부터 5ms로 재시작
+* 실패 시 `HandleError` 로깅 + `queue.AddRateLimited(key)` — 기본 backoff: `baseDelay(5ms) * 2^실패횟수`, 최대 1000s
 
 ## 5. `syncReplicaSet()` — Reconcile 루프
 
@@ -893,38 +903,8 @@ if apierrors.IsNotFound(err) {
 
 * 로컬 캐시에서 RS 조회 — API 서버 호출 없음
 * `IsNotFound` → RS 이미 삭제됨 → expectations 정리 후 정상 종료
-    * `nil` 반환으로 worker가 `queue.Forget(key)` 호출 → 재시도 카운터 초기화
+    * `nil` 반환으로 worker가 `queue.Forget(key)` 호출 → 재시도 카운터 초기화 (4.5 참조)
 * 조회한 RS는 "Informer가 마지막으로 수신한 스냅샷" — 실제 현재 상태와 약간의 차이 가능
-
-##### 비고 — queue.Forget 동작
-
-`RateLimitingInterface`는 두 개의 독립된 상태를 관리함
-
-| 레이어          | 관련 메서드                               | 추적 내용                             |
-|--------------|--------------------------------------|-----------------------------------|
-| Base Queue   | `Get()`, `Done(key)`                 | 현재 처리 중인 키 (`processing` 집합)      |
-| Rate Limiter | `AddRateLimited(key)`, `Forget(key)` | 키별 실패 횟수 (`failures map[key]int`) |
-
-`processNextWorkItem` 흐름:
-
-```go
-key, quit := rsc.queue.Get()       // processing 집합에 추가
-defer rsc.queue.Done(key)          // 항상: processing에서 제거
-
-err := rsc.syncHandler(ctx, key)
-if err == nil {
-    rsc.queue.Forget(key)          // 성공 시: rate limiter 실패 카운터 삭제
-    return true
-}
-rsc.queue.AddRateLimited(key)      // 실패 시: backoff delay 후 큐 재삽입
-return true
-```
-
-* `Forget(key)` = rate limiter의 `delete(failures, key)` — 큐에서 제거하는 게 아님
-* 기본 backoff: `baseDelay(5ms) * 2^실패횟수`, 최대 1000s
-    * `Forget` 없이 성공하면 `failures` 맵에 이전 실패 횟수가 남음 → 다음 실패 시 누적된 backoff 적용
-    * `Forget` 호출 → 카운터 초기화 → 다음 실패부터 5ms로 재시작
-* `Done`과 `Forget`은 완전히 다른 레이어 — `Forget`만 호출하고 `Done` 생략 시 해당 키가 `processing`에 남아 큐에서 재처리 불가
 
 #### 2단계 — Pod 목록 수집 & 분류
 
