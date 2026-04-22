@@ -655,12 +655,21 @@ for _, rs := range rss {
 }
 ```
 
-* **`DeletionTimestamp` 있는 경우** → `deletePod()` 위임 (컨트롤러 재시작 시 이미 삭제 중인 Pod가 보일 수 있음)
+* **`DeletionTimestamp` 있는 경우** → `deletePod()` 위임
+    * Add 이벤트인데 왜 `DeletionTimestamp`가 있을 수 있는가:
+        * **컨트롤러 재시작**: Informer가 List로 전체 Pod 목록을 받아 캐시를 채울 때, 이미 삭제 진행 중인 Pod(Soft Delete 상태)도 포함 → 캐시에 새로 올라오므로 Add 이벤트 발생
+        * **Soft Delete 특성**: `kubectl delete` 등으로 삭제하면 API 서버가 `DeletionTimestamp`만 설정(Soft Delete). kubelet이 graceful termination 완료 후 finalizer 제거 시 etcd에서 실제 삭제. Soft Delete → 실제 삭제 사이에 Informer Relist 등으로 Add 이벤트가 발생 가능
 * **ControllerRef 있는 경우** (일반)
     * `expectations.CreationObserved(rsKey)` — add 카운터 즉시 차감
     * owner RS 키를 queue에 삽입
 * **ControllerRef 없는 고아 Pod**
+    * 일반적으로 RS가 Pod를 생성할 때 `ownerReference`를 설정하므로 처음부터 ControllerRef가 있음. 고아 Pod가 생기는 경우:
+        * 사용자가 직접 Pod를 수동 생성 (`kubectl run ...`)
+        * RS를 `--cascade=orphan`으로 삭제 → Pod는 남지만 owner RS가 사라짐
+        * 컨트롤러 버그·레이스 컨디션으로 ownerReference 설정 실패
     * 셀렉터 매칭 RS 전부 enqueue — 입양 여부 판단은 `syncReplicaSet`에서 수행
+        * 매칭 기준: 같은 네임스페이스의 RS를 조회하고, `rs.Spec.Selector`가 Pod 레이블을 포함하는 RS만 대상
+        * 셀렉터 겹침으로 여러 RS가 매칭될 수 있음 — 각 RS의 `syncReplicaSet`에서 ownerReference 패치를 시도하고, 먼저 성공한 RS가 소유권 획득
     * expectations 차감 안 함 — 고아 Pod 생성을 기다리는 컨트롤러 없음
 
 **`deletePod()`**
@@ -668,26 +677,33 @@ for _, rs := range rss {
 > `pkg/controller/replicaset/replica_set.go:L581`
 
 ```go
-// tombstone 처리 (addRS와 동일 패턴)
 pod, ok := obj.(*v1.Pod)
 if !ok {
     tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+    if !ok { ... }
     pod, ok = tombstone.Obj.(*v1.Pod)
+    if !ok { ... }
 }
 
 controllerRef := metav1.GetControllerOf(pod)
 if controllerRef == nil {
-    return  // 고아 Pod 무시
+    return  // 고아 Pod — 삭제에 관심 있는 컨트롤러 없음
 }
 rs := rsc.resolveControllerRef(pod.Namespace, controllerRef)
+if rs == nil {
+    return
+}
+rsKey, err := controller.KeyFunc(rs)
+if err != nil { ... }
 rsc.expectations.DeletionObserved(logger, rsKey, controller.PodKey(pod))
 rsc.queue.Add(rsKey)
 ```
 
-* ControllerRef 없는 고아 Pod → 무시
-* tombstone 처리 — Delete 이벤트 유실 시에도 처리 가능 (RS Informer와 동일 패턴)
-* `expectations.DeletionObserved(rsKey, podUID)` — del expectations에서 해당 UID 제거 (즉시)
-* owner RS 키를 queue에 삽입
+* tombstone 2단계 assertion — `deleteRS`와 동일 패턴. `*v1.Pod` → `DeletedFinalStateUnknown` → `.Obj` 추출
+* ControllerRef 없는 고아 Pod → 무시 — 삭제에 관심 있는 컨트롤러 없음
+* `resolveControllerRef` — ControllerRef가 가리키는 RS를 캐시에서 조회. `nil`이면 해당 RS가 이미 삭제됐거나 다른 Kind → return
+* `expectations.DeletionObserved(rsKey, podUID)` — del expectations에서 해당 Pod UID 제거
+* owner RS 키를 queue에 삽입 → `syncReplicaSet`에서 status 갱신 및 부족분 재생성 판단
 
 **`updatePod()`**
 
@@ -696,11 +712,15 @@ rsc.queue.Add(rsKey)
 ```go
 if curPod.ResourceVersion == oldPod.ResourceVersion { return }
 
+labelChanged := !reflect.DeepEqual(curPod.Labels, oldPod.Labels)
 if curPod.DeletionTimestamp != nil {
     rsc.deletePod(logger, curPod)
     if labelChanged { rsc.deletePod(logger, oldPod) }
     return
 }
+curControllerRef := metav1.GetControllerOf(curPod)
+oldControllerRef := metav1.GetControllerOf(oldPod)
+controllerRefChanged := !reflect.DeepEqual(curControllerRef, oldControllerRef)
 if controllerRefChanged && oldControllerRef != nil {
     if rs := rsc.resolveControllerRef(oldPod.Namespace, oldControllerRef); rs != nil {
         rsc.enqueueRS(rs)
@@ -708,7 +728,13 @@ if controllerRefChanged && oldControllerRef != nil {
 }
 if curControllerRef != nil {
     rs := rsc.resolveControllerRef(curPod.Namespace, curControllerRef)
+    if rs == nil {
+        return
+    }
     rsc.enqueueRS(rs)
+    if !podutil.IsPodReady(oldPod) && podutil.IsPodReady(curPod) && rs.Spec.MinReadySeconds > 0 {
+        rsc.enqueueRSAfter(rs, time.Duration(rs.Spec.MinReadySeconds)*time.Second)
+    }
     return
 }
 if labelChanged || controllerRefChanged {
@@ -719,11 +745,17 @@ if labelChanged || controllerRefChanged {
 
 * `ResourceVersion` 동일 → 무시 (Informer 주기적 재동기화에 의한 중복 이벤트)
 * **`DeletionTimestamp` 설정됨** → `deletePod()` 위임
-    * graceful 삭제 시 실제 삭제까지 기다리지 않고 `DeletionTimestamp` 설정 시점에 즉시 삭제로 처리 → RS가 빠르게 대체 Pod 생성
-    * 레이블도 변경된 경우 old/cur 모두 `deletePod()` 호출
-* **ControllerRef 변경됨** → 이전 owner RS도 enqueue (소유권 이전 시 양쪽 RS Reconcile)
+    * **왜 즉시 처리하는가**: Pod 삭제는 2단계 — ① API 서버가 `DeletionTimestamp` 설정(Soft Delete) → ② kubelet이 preStop 훅·SIGTERM·grace period(기본 30초) 후 실제 종료·Delete 이벤트. 실제 Delete 이벤트를 기다리면 grace period 동안 대체 Pod가 생성되지 않아 가용성 공백 발생. `DeletionTimestamp` 시점에 즉시 "삭제된 것"으로 처리해 대체 Pod를 곧바로 생성
+    * **레이블 변경 시 old/cur 모두 `deletePod()` 호출**: 레이블이 바뀌면 소속 RS가 달라질 수 있음. `deletePod(curPod)`로 새 레이블 기준 RS에 통보, `deletePod(oldPod)`로 이전 레이블 기준 RS에도 통보 → 양쪽 RS 모두 expectations 차감 및 부족분 재계산 가능. `DeletionTimestamp`는 한 번 설정되면 해제 불가이므로 oldPod의 `DeletionTimestamp`를 별도로 확인할 필요 없음
+* **ControllerRef 변경됨** → 이전 owner RS도 enqueue
+    * 소유권이 RS-A → RS-B로 이전된 경우, RS-A는 소유 Pod 감소·RS-B는 소유 Pod 증가 — 양쪽 모두 Reconcile 필요
 * **ControllerRef 있음** (일반) → owner RS enqueue
+    * `resolveControllerRef` — ControllerRef의 UID로 Informer 캐시에서 RS 조회. `nil` 반환 시: RS가 이미 삭제되어 캐시에 없거나, ControllerRef의 Kind가 ReplicaSet이 아닌 경우 → return
+    * **MinReadySeconds 지연 enqueue**: Pod가 NotReady→Ready로 전환되고 `rs.Spec.MinReadySeconds > 0`이면 즉시 enqueue + `enqueueRSAfter`로 해당 초 뒤에 한 번 더 enqueue
+        * **즉시 enqueue 이유**: `status.readyReplicas`는 MinReadySeconds와 무관하게 Ready 여부만으로 계산 — 즉시 반영 필요
+        * **지연 enqueue 이유**: `status.availableReplicas`는 Ready 후 MinReadySeconds 경과해야 인정. 해당 시간 경과 후 `syncReplicaSet`을 다시 실행해야 Available 조건 갱신 가능 — 이 enqueue가 없으면 상태 변화를 유발할 이벤트가 없어 `availableReplicas`가 갱신되지 않음
 * **고아 Pod의 레이블/ControllerRef 변경** → 매칭 RS 전부 enqueue (입양 가능성 확인)
+    * 여기에 도달했다는 것은 `curControllerRef == nil` — 현재 Pod에 owner RS가 없는 고아 상태
 
 **syncHandler 와이어링**
 
