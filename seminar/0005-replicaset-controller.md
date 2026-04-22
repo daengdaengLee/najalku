@@ -449,8 +449,11 @@ func NewReplicaSetController(ctx context.Context, rsInformer appsinformers.Repli
 ```
 
 * ReplicaSet 전용 설정을 조립해서 `NewBaseController`로 위임하는 얇은 래퍼
-* `NewBaseController`는 ReplicationController(`replication.ReplicationManager`)와 공유하는 공통 구현 — GVK·metric 이름·queueName만 바꿔서 두 컨트롤러 모두 지원
-* `RealPodControl` — Pod 생성(`CreatePods`)/삭제(`DeletePod`) 실제 수행 구현체. `KubeClient`로 API 호출, `Recorder`로 이벤트 기록, `OnWrite` 콜백으로 쓰기 후 `consistencyStore` 갱신
+* `NewBaseController`는 `ReplicationController`(`pkg/controller/replication`)와 공유하는 공통 구현
+    * **ReplicationController란** — ReplicaSet의 전신(`v1.ReplicationController`). "원하는 수의 Pod 유지"라는 역할은 동일하지만 등호 셀렉터(`=`)만 지원하고 집합 기반 셀렉터(`in`, `notin`)를 지원하지 않는 제한이 있어 ReplicaSet으로 대체됨. 현재는 하위 호환 목적으로 잔존
+    * **왜 공유하는가** — 두 컨트롤러의 reconcile 로직(Informer 핸들러, WorkQueue, syncHandler, expectations 관리)이 동일. 달라지는 건 "어떤 리소스 타입을 다루는가"뿐이므로 공통 로직을 `NewBaseController`로 추출하고 리소스 타입 정보(GVK, metric 이름, queueName)를 파라미터로 주입
+        * **GVK(`GroupVersionKind`)란** — Kubernetes API 타입을 유일하게 식별하는 3-tuple. `apps/v1/ReplicaSet` vs `v1/ReplicationController`(core group, Group은 빈 문자열). Pod 생성 시 `ownerReference`의 Kind 필드 설정에 사용
+* `RealPodControl` — `PodControlInterface`(`pkg/controller/controller_utils.go:L470`)의 실제 구현체. Pod 생성(`CreatePods`)/삭제(`DeletePod`) API 호출 + `Recorder`로 이벤트 기록. 테스트 코드에서는 `FakePodControl`로 교체 가능
 * `consistencyStore` — `StaleControllerConsistencyReplicaSet` feature gate 활성 시 Pod 쓰기의 ResourceVersion 추적 → Informer 캐시가 아직 반영하지 못한 stale 데이터 기반 Reconcile 방지
 * `eventBroadcaster` — 컨트롤러 이벤트(Pod 생성/삭제 성공·실패 등)를 API 서버에 기록하고 구조화 로깅
 
@@ -490,6 +493,7 @@ rsc := &ReplicaSetController{
     * 생성(add): 단순 카운터 — Pod Add 이벤트마다 1 차감
     * 삭제(del): UID 목록 추적 — 삭제 요청한 특정 Pod의 UID만 매칭 (단순 카운터면 다른 Pod 크래시가 잘못 차감 가능)
     * TTL: 응답 없어도 만료 후 Reconcile 재개 → 무한 블로킹 방지
+    * 실제 동작(ExpectCreations, ExpectDeletions, SatisfiedExpectations 호출 흐름)은 5절 manageReplicas에서 상세 설명
 * `burstReplicas`와 `slowStartBatch` 관계:
     * `burstReplicas`: 한 번의 Reconcile에서의 최대 수 제한 (바깥 한계)
     * `slowStartBatch`: 그 안에서 1→2→4→8 배치로 점진적 생성 (안의 속도 조절) — 6절에서 상세 설명
@@ -530,13 +534,14 @@ controller.AddPodControllerIndexer(podInformer.Informer())
 rsc.podIndexer = podInformer.Informer().GetIndexer()
 ```
 
-* RS/Pod Informer 모두 큐에 **RS 키**를 삽입 — Reconcile 단위는 항상 RS
-* `controllerUIDIndex` — RS의 ownerReference(Deployment) UID로 인덱싱. `getReplicaSetsWithSameController`에서 같은 Deployment 아래 형제 RS를 빠르게 조회 (삭제 대상 선정 시 사용)
-* `AddPodControllerIndexer` — Pod의 namespace + ownerReference UID로 인덱싱. `FilterPodsByOwner`에서 RS가 소유한 Pod 및 고아 Pod를 효율적으로 조회
+* `AddEventHandler`로 이벤트 발생 시 호출될 핸들러 메서드를 등록 — 이벤트가 발생하면 Informer가 해당 핸들러를 호출
+* 각 핸들러(`addRS`, `addPod` 등) 내부에서 최종적으로 **RS 키**를 큐에 삽입 — RS/Pod 이벤트 모두 "어느 RS를 reconcile할지"로 변환됨 (상세는 아래 핸들러 분석 참조)
+* `controllerUIDIndex` — RS의 ownerReference(Deployment) UID로 인덱싱. `getReplicaSetsWithSameController`에서 같은 Deployment 아래 형제 RS를 빠르게 조회 (5절 삭제 경로에서 상세)
+* `AddPodControllerIndexer` — Pod의 namespace + ownerReference UID로 인덱싱. `FilterPodsByOwner`에서 RS가 소유한 Pod 및 고아 Pod를 효율적으로 조회 (5절 Pod 목록 수집 단계에서 상세)
 * `rsLister`/`podLister` — 로컬 캐시 읽기 전용 뷰 (API 서버 호출 없이 메모리 즉시 조회)
 * `rsListerSynced`/`podListerSynced` — `Run()`에서 캐시 동기화 완료 대기 시 사용 (4.4에서 상세)
 
-##### 유틸 함수: `enqueueRS`
+**유틸 함수: `enqueueRS`**
 
 > `pkg/controller/replicaset/replica_set.go:L367`
 
@@ -553,7 +558,7 @@ func (rsc *ReplicaSetController) enqueueRS(rs *apps.ReplicaSet) {
     * 입력이 RS 오브젝트면 `enqueueRS`, 키를 이미 갖고 있으면 `queue.Add` 직접 호출
     * 결과는 동일
 
-##### RS Informer 핸들러
+**RS Informer 핸들러**
 
 **`addRS()`**
 
@@ -583,6 +588,7 @@ rsc.enqueueRS(curRS)
 * `spec.replicas` 변경 외에도 Update 이벤트 발생 시 무조건 enqueue
     * status 업데이트로 불필요한 Reconcile이 일부 발생하지만 로컬 캐시만 읽으므로 부하 없음
     * Pod 생성 실패로 멈춘 RS를 Informer 전체 재동기화 시 복구 가능
+        * 시나리오: Pod 생성 API 실패(쿼터 초과 등) → 더 이상 새 이벤트 없음 → RS가 큐에 재삽입되지 않아 멈춤 → Informer resync가 RS에 대해 Update 이벤트 강제 발생 → `updateRS`가 무조건 enqueue → Reconcile 재개
 * UID 변경 감지 (같은 이름으로 RS 재생성된 경우)
     * Informer가 Delete + Add 대신 하나의 Update로 합칠 수 있는 알려진 한계 (소스 TODO 주석 확인)
     * `curRS.UID != oldRS.UID` → `deleteRS(oldRS)` 호출로 이전 RS의 stale expectations 강제 삭제
@@ -613,15 +619,19 @@ rsc.queue.Add(key)
     * 1단계: `obj`를 `*apps.ReplicaSet`으로 직접 assertion → 정상 Delete 이벤트
     * 2단계: 실패 시 `cache.DeletedFinalStateUnknown`으로 assertion → tombstone에서 `.Obj` 추출
 * **tombstone이란** — Watch 연결 끊김 후 Relist 시 DeltaFIFO가 합성하는 가짜 Delete 이벤트 래퍼
-    * Watch가 끊긴 사이에 삭제된 오브젝트 → Delete 이벤트 미수신
-    * Relist로 받은 새 목록에 해당 키 없음 → DeltaFIFO가 "삭제됐음"을 추론
-    * 마지막으로 알려진(stale할 수 있는) 오브젝트를 `DeletedFinalStateUnknown{Key, Obj}`로 감싸 전달
+    * **언제 발생하는가**: Watch 스트림이 끊기면 Informer가 자동으로 List API로 전체 목록을 다시 받아옴(Relist). 이 시점에 DeltaFIFO가 "이전에 알고 있던 키인데 새 목록에 없다" → 삭제된 것으로 추론해 tombstone 합성
+    * **왜 `Obj`가 stale할 수 있는가**: `Obj`는 "마지막으로 알려진 오브젝트". Watch가 끊긴 사이에 오브젝트가 수정된 후 삭제됐다면 `Obj`는 수정 전 상태를 담고 있음 → 타입 이름이 `DeletedFinal**StateUnknown**`인 이유
+    * **왜 2단계 assertion이 필요한가**: 정상 Watch 경로는 `*apps.ReplicaSet`으로 직접 전달, Watch 끊김 후 Relist 경로는 `DeletedFinalStateUnknown{Key, Obj}`로 감싸서 전달 — 두 경로가 달라서 각각 처리
     * 정의: `staging/src/k8s.io/client-go/tools/cache/delta_fifo.go:L793~800`
-* `consistencyStore.Clear(...)` — 삭제된 RS의 일관성 추적 데이터 제거
+* `consistencyStore.Clear(...)` — 삭제된 RS의 `WroteAt` 기록 제거
+    * **왜 필요한가**: `consistencyStore`는 Pod 쓰기 시점의 ResourceVersion을 기록해두고, `syncReplicaSet` 진입 시 `EnsureReady`로 캐시가 따라잡았는지 검사. RS가 삭제되면 더 이상 Reconcile이 일어나지 않으므로 추적 데이터가 불필요 — 제거하지 않으면 메모리 누수
+    * **UID 매칭**: `Clear(owner, ownerUID)`는 UID가 일치할 때만 삭제 — 같은 이름의 새 RS(다른 UID)가 생성되어도 새 RS의 기록은 보존
 * `expectations.DeleteExpectations(key)` — 해당 RS의 expectations 전부 삭제
 * `queue.Add(key)` — Reconcile 기회 부여 (이미 삭제됐으면 즉시 종료)
+    * `syncReplicaSet` 진입 시 `rsLister.Get` → `IsNotFound`이면 `return nil` (`replica_set.go:L778~783`)
+    * 이벤트 핸들러 누락·캐시 지연 시에도 reconcile 루프가 동일하게 정리 — Reconcile 루프 내 방어 로직
 
-##### Pod Informer 핸들러
+**Pod Informer 핸들러**
 
 **`addPod()`**
 
