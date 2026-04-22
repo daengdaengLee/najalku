@@ -963,9 +963,12 @@ if rsNeedsSync && rs.DeletionTimestamp == nil {
 }
 ```
 
-* `rsNeedsSync = true` 조건 (둘 중 하나)
-    * add/del expectations가 모두 0 — 미충족 작업 없음
-    * expectations TTL 만료 — 무한 블로킹 방지
+* `rsNeedsSync = true` = "이전 요청이 캐시에 반영되어 diff 계산이 안전한 상태"
+    * expectations은 "할 일이 있는가"가 아니라 **"이전에 요청한 Pod 생성/삭제가 Informer 캐시에 반영됐는가"**를 추적
+    * 미충족 시 `manageReplicas`를 건너뛰는 이유: 캐시가 stale → 같은 diff 재계산 → Pod 중복 생성/삭제 위험
+    * `Fulfilled()`: add/del expectations가 모두 0 이하 — 이전 요청이 캐시에 반영 완료 (음수 가능: Informer 이벤트가 expectations 등록보다 먼저 도착한 경우)
+    * `isExpired()`: expectations TTL 만료 — 무한 블로킹 방지
+    * expectations 자체가 없음 — 처음 생성된 RS 또는 이전 expectations 정리 완료
 * `rs.DeletionTimestamp == nil` 조건
     * RS 삭제 중 → 새 Pod 생성 불필요, 삭제 대상 Pod는 GC에 위임
 * 두 조건 중 하나라도 불만족 → `manageReplicas` 건너뜀 → 상태 업데이트만 수행
@@ -987,20 +990,38 @@ diff := len(activePods) - int(*(rs.Spec.Replicas))
 > `pkg/controller/replicaset/replica_set.go:L657~698`
 
 ```go
-diff = min(-diff, rsc.burstReplicas)
+diff *= -1
+if diff > rsc.burstReplicas {
+    diff = rsc.burstReplicas
+}
 rsc.expectations.ExpectCreations(logger, rsKey, diff)
 successfulCreations, err := slowStartBatch(diff, controller.SlowStartInitialBatchSize, func() error {
-    return rsc.podControl.CreatePods(...)
+    err := rsc.podControl.CreatePods(...)
+    if err != nil {
+        if apierrors.HasStatusCause(err, v1.NamespaceTerminatingCause) {
+            return nil  // 네임스페이스 종료 중 → 성공 처리, 재시도 안 함
+        }
+    }
+    return err
 })
 // slowStartBatch 중단으로 시도 못 한 Pod 수만큼 expectations 즉시 차감
-for i := 0; i < diff-successfulCreations; i++ {
-    rsc.expectations.CreationObserved(logger, rsKey)
+if skippedPods := diff - successfulCreations; skippedPods > 0 {
+    for i := 0; i < skippedPods; i++ {
+        rsc.expectations.CreationObserved(logger, rsKey)
+    }
 }
 ```
 
 * `burstReplicas` 상한 적용 (기본 500)
 * `ExpectCreations(diff)` **먼저** 등록 → 이후 Pod Add 이벤트가 차감
 * 배치 중단 시 건너뛴 수만큼 즉시 차감 → Informer 이벤트 없이 선제 차감하지 않으면 블로킹
+    * `slowStartBatch`는 배치 중 에러 발생 시 즉시 반환 — 이후 배치는 시도 자체를 안 함                                                                 
+    * `skippedPods = diff - successfulCreations` → 시도 못 한 수만큼 `CreationObserved` 호출 (정상 완료 시 `skippedPods = 0`이므로 진입 안 함)
+* 네임스페이스 삭제 중 Pod 생성 실패(`NamespaceTerminatingCause`) → 콜백이 `nil` 반환으로 성공 처리
+    * `slowStartBatch` 관점에서 에러 없음 → 배치 중단 없이 모든 `diff`개 시도 완료
+    * `successfulCreations == diff` → `skippedPods = 0` → `CreationObserved` 미호출
+    * 실제 Pod는 생성되지 않았으므로 Informer Add 이벤트 없음 → expectations 미충족 유지 → TTL 만료로 자연 해소
+    * 의도: `nil` 반환 없이 에러를 그대로 전파하면 `skippedPods > 0` → `CreationObserved` 일부 호출 → 다음 resync 때 재시도 → 또 실패 → 무한 반복 + API 스팸
 
 **삭제 경로 (diff > 0)**
 
