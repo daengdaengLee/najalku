@@ -1852,8 +1852,6 @@ RS-old에서 3→1로 축소(2개 삭제) 시점:
 
 → 롤링 업데이트 중에도 각 노드에 파드가 균등 분포 유지
 
----
-
 ## 8. 마무리
 
 ### ReplicaSet Controller = k8s 컨트롤러 패턴의 교과서
@@ -1868,7 +1866,40 @@ RS-old에서 3→1로 축소(2개 삭제) 시점:
 * kube-proxy는 Service / EndpointSlice 변경을 감지 → iptables 규칙 갱신
 * "ClusterIP로 패킷을 보내면 어떻게 Pod에 도달하는가"
 
----
+#### ReplicaSet Controller → kube-proxy 연결 고리
+
+**패턴 측면** — 같은 뼈대, 다른 도메인
+
+|            | ReplicaSet Controller            | kube-proxy                       |
+|------------|----------------------------------|----------------------------------|
+| **감시 대상**  | ReplicaSet, Pod                  | Service, EndpointSlice           |
+| **원하는 상태** | `spec.replicas`에 적힌 파드 수         | ClusterIP:Port → Pod IP 매핑       |
+| **현재 상태**  | 실제 Running 파드 수                  | 노드에 적용된 iptables 규칙              |
+| **조정 행동**  | 파드 생성 / 삭제                       | iptables 규칙 추가 / 삭제              |
+| **패턴**     | Informer → WorkQueue → Reconcile | Informer → WorkQueue → Reconcile |
+
+**데이터 흐름 측면** — 두 컨트롤러는 실제로 연결되어 있음
+
+kube-proxy는 ReplicaSet Controller의 결과물을 입력으로 사용
+
+```
+ReplicaSet Controller
+  → 파드 생성/삭제
+  → 파드에 IP 할당
+  → EndpointSlice Controller가 EndpointSlice 갱신
+  → kube-proxy가 EndpointSlice 변경 감지
+  → iptables 규칙 갱신
+  → ClusterIP → 새 파드 IP로 트래픽 도달
+```
+
+예: `replicas: 2 → 3` scale-out 시
+
+1. ReplicaSet Controller 가 파드 1개 생성 → 파드에 `10.0.0.5` IP 부여
+2. EndpointSlice Controller 가 해당 Service의 EndpointSlice에 `10.0.0.5` 추가
+3. kube-proxy 가 EndpointSlice 변경 감지 → iptables에 `ClusterIP:80 → 10.0.0.5:8080` DNAT 규칙 추가
+4. ClusterIP로 보낸 패킷이 새 파드에 도달
+
+두 컨트롤러는 API 서버를 매개로 느슨하게 결합되어 있고, 각자 자기 책임만 가짐 -> 이것이 Kubernetes 컨트롤러 아키텍처의 핵심
 
 ## 9. 부록: 주요 코드 경로
 
