@@ -1204,6 +1204,7 @@ if nextSyncDuration != nil {
 ## 6. `slowStartBatch()` — 왜 한꺼번에 생성하지 않는가
 
 * Pod를 1→2→4→8 배치로 점진적으로 생성하는 메커니즘
+* **생성 경로 전용** — 삭제는 병렬 goroutine으로 처리. 이유는 5절 `생성 vs 삭제 비대칭 설계` 표 참조
 
 ### 배치 성장 패턴
 
@@ -1216,10 +1217,182 @@ initialCount = 1
 배치 N: 남은 수 전부 시도
 ```
 
+* 마지막 배치는 `min(2*batchSize, remaining)`로 클램프 — 2배가 아닌 "남은 수"로 잘릴 수 있음
 * 어느 배치에서든 오류 발생 시 이후 배치 모두 중단
-* 설계 의도: API 서버 부하 제어 — 한꺼번에 수백 개 요청 시 API 서버 과부하 방지
+* 설계 의도: 2갈래
+    * **공통 실패 원인 조기 감지** — 쿼터·admission 거부 등은 클러스터 단위 조건이므로 첫 배치에서 바로 드러남 → doomed call 최소화
+    * **이벤트 스팸 억제** — 소스 주석 원문 (`replica_set.go:L675~L676`): "Conveniently, this also prevents the event spam that those failures would generate."
 
-* (상세 코드 분석 예정)
+### 호출 맥락
+
+> `pkg/controller/replicaset/replica_set.go:L677~L687`
+
+```go
+successfulCreations, err := slowStartBatch(diff, controller.SlowStartInitialBatchSize, func() error {
+    err := rsc.podControl.CreatePods(ctx, rs.Namespace, &rs.Spec.Template, rs, metav1.NewControllerRef(rs, rsc.GroupVersionKind))
+    if err != nil {
+        if apierrors.HasStatusCause(err, v1.NamespaceTerminatingCause) {
+            return nil
+        }
+    }
+    return err
+})
+```
+
+* 파라미터 해석:
+    * `count = diff` — 부족한 Pod 수 (`burstReplicas` 상한 적용 후, 5절 생성 경로 참조)
+    * `initialBatchSize = controller.SlowStartInitialBatchSize = 1` — 상수 정의 위치: `pkg/controller/controller_utils.go:L87`
+    * `fn = CreatePods 콜백` — `NamespaceTerminatingCause` 시 `nil` 반환으로 성공 처리 (5절 생성 경로 참조)
+
+**`SlowStartInitialBatchSize = 1`의 의미 — 수식으로 보기**
+
+> `pkg/controller/controller_utils.go:L73~L87`
+
+```
+// Given a number of pods to start "N":
+// The number of doomed calls per sync once quota is exceeded is given by:
+//      min(N,SlowStartInitialBatchSize)
+// The number of batches is given by:
+//      1+floor(log_2(ceil(N/SlowStartInitialBatchSize)))
+SlowStartInitialBatchSize = 1
+```
+
+* N≥1 전제 — `manageReplicas`의 `diff < 0` 분기에서만 호출되므로 자연 보장
+* 쿼터 초과 시 무조건 실패하는 doomed call 수 = `min(N, 1)` = **1**
+* 총 배치 수 = `1 + floor(log_2(N))` (initialBatchSize=1 대입)
+* 값이 클수록 doomed call 증가, 작을수록 라운드트립 횟수 증가 → 1이 균형점
+* **`=1`이 의미하는 바 — 완전한 fail-fast**: 실패 원인이 공통일 때 1회 시도에서 즉시 중단. 이 상수 값 자체가 "한 번 실패하면 끝"이라는 설계를 코드에 못박음
+
+**배치 수 계산 예시**
+
+| N (diff)               | 배치 크기 순서                             | 총 배치 수 |
+|------------------------|--------------------------------------|--------|
+| 1                      | 1                                    | 1      |
+| 3                      | 1, 2                                 | 2      |
+| 7                      | 1, 2, 4                              | 3      |
+| 10                     | 1, 2, 4, **3**                       | 4      |
+| 500 (burstReplicas 상한) | 1, 2, 4, 8, 16, 32, 64, 128, **245** | 9      |
+
+* 굵은 숫자: 마지막 배치가 `min(2*batchSize, remaining)`으로 잘린 사례
+* N=500 검증: 1+2+4+8+16+32+64+128 = 255, 마지막 `min(256, 245)` = **245**, 합계 500
+
+### 상세 코드 분석
+
+> `pkg/controller/replicaset/replica_set.go:L887~L911`
+
+```go
+func slowStartBatch(count int, initialBatchSize int, fn func() error) (int, error) {
+    remaining := count
+    successes := 0
+    for batchSize := min(remaining, initialBatchSize); batchSize > 0; batchSize = min(2*batchSize, remaining) {
+        errCh := make(chan error, batchSize)
+        var wg sync.WaitGroup
+        wg.Add(batchSize)
+        for i := 0; i < batchSize; i++ {
+            go func() {
+                defer wg.Done()
+                if err := fn(); err != nil {
+                    errCh <- err
+                }
+            }()
+        }
+        wg.Wait()
+        curSuccesses := batchSize - len(errCh)
+        successes += curSuccesses
+        if len(errCh) > 0 {
+            return successes, <-errCh
+        }
+        remaining -= batchSize
+    }
+    return successes, nil
+}
+```
+
+#### 루프 헤더
+
+* `batchSize := min(remaining, initialBatchSize)` — 초기값: `min(N, 1)` = 1 (N≥1 전제)
+* 종료 조건 `batchSize > 0` — 모든 Pod 생성 완료 시 `remaining == 0` → `min(2*b, 0) == 0` → 루프 자연 종료
+* 증가식 `batchSize = min(2*batchSize, remaining)` — 2배 성장하되 남은 수로 상한 클램프
+
+#### 배치 내부 동작
+
+* `batchSize`개 goroutine을 동시에 띄워 `fn()` 호출 — **배치 내부는 완전 병렬**
+* `errCh`: 버퍼 크기 `batchSize` — 실패한 goroutine이 non-blocking으로 에러 전송
+* `wg.Wait()`: 현 배치 전체 완료 대기 → 다음 배치 시작 전 동기화 포인트
+
+**배치 내부 병렬성은 제한하지 않음 — "배치 간" 부하 제어**
+
+* `slowStartBatch`는 배치 **사이**에 fail-fast 체크를 두는 구조, 배치 **내부** 동시 요청 수는 제한하지 않음
+* N=500 기준 최악 케이스: 9번째 배치에서 245개 goroutine이 동시에 `CreatePods` API 호출
+* 배치 내부 부하 조절은 client-go rate limiter(`--kube-api-qps/--kube-api-burst`) 담당 — `slowStartBatch`는 그 위 계층에서 "실패 조기 감지"만 담당
+* 즉 "한꺼번에 수백 개 요청 방지"는 **점진 성장 + 실패 시 중단** 관점이지 **동시 goroutine 수 제한** 관점이 아님
+
+#### 성공/실패 집계 & 중단 분기
+
+* `curSuccesses := batchSize - len(errCh)` — errCh에 쌓인 에러 수로 실패 수 역산
+* `successes += curSuccesses` — 누적
+* `if len(errCh) > 0 { return successes, <-errCh }` — 에러 1개라도 있으면 이후 배치 전부 건너뜀
+    * `<-errCh`로 대표 에러 1개만 반환 — 에러가 동일 원인일 가능성이 높다는 가정 (5절 생성 vs 삭제 비대칭 참조)
+    * `wg.Wait()` 이후이므로 현 배치 내 성공한 Pod는 모두 카운트 후 반환
+* 정상 진행: `remaining -= batchSize` → 다음 iteration의 `min(2*batchSize, remaining)` 계산
+
+### 경계 조건 & 시나리오
+
+**전원 성공 시나리오 (N=10)**
+
+```
+배치 1: 시도 1개  → 성공 1  → successes=1,  remaining=9
+배치 2: 시도 2개  → 성공 2  → successes=3,  remaining=7
+배치 3: 시도 4개  → 성공 4  → successes=7,  remaining=3
+배치 4: 시도 3개  → 성공 3  → successes=10, remaining=0
+→ return 10, nil
+```
+
+* `successfulCreations=10`, `skippedPods = 10 - 10 = 0` → `CreationObserved` 미호출
+
+**첫 배치 실패 시나리오 (N=10, 1회차에서 쿼터 초과)**
+
+```
+배치 1: 시도 1개  → 실패 1  → successes=0, errCh=[QuotaExceeded]
+        len(errCh) > 0  → return 0, QuotaExceeded
+```
+
+* `successfulCreations=0`, `skippedPods = 10 - 0 = 10` → `CreationObserved` 10회 수동 차감 (5절 생성 경로 참조)
+* API 서버에 1회 요청만 가고 즉시 중단 — "doomed call = 1" 원리 시현
+
+**중간 배치 실패 시나리오 (N=15, 3회차 배치 4개 중 2개 실패)**
+
+```
+배치 1: 시도 1개  → 성공 1        → successes=1,  remaining=14
+배치 2: 시도 2개  → 성공 2        → successes=3,  remaining=12
+배치 3: 시도 4개  → 성공 2, 실패 2 → curSuccesses=2, successes=5
+        wg.Wait() — 배치 내 전체 goroutine 종료 후 집계
+        len(errCh) > 0  → return 5, <err>
+```
+
+* `successfulCreations=5`, `skippedPods = 15 - 5 = 10` → `CreationObserved` 10회
+* 3회차 배치에서 성공한 2개는 이미 API 서버에 생성됨 — `wg.Wait()` 이후 집계
+
+**`NamespaceTerminatingCause` 시나리오 (N=10, 네임스페이스 삭제 중)**
+
+```
+배치 1~4: fn() 전부 nil 반환 → errCh 비어 있음 → 배치 중단 없이 전 배치 완료
+→ return 10, nil
+```
+
+* `successfulCreations=10`, `skippedPods=0` → `CreationObserved` 미호출 → expectations TTL 만료로 자연 해소
+* 5절 `생성 경로` NamespaceTerminatingCause 항목 참조
+
+**엣지: `count=0` 진입 시**
+
+* `batchSize := min(0, 1) = 0` → `batchSize > 0` 불만족 → 루프 미진입 → `return 0, nil`
+* 실무상 발생 경로 없음 — `manageReplicas`의 `diff < 0` 분기에서만 진입하므로 `count=0` 호출 불가
+* 함수 자체는 0 입력에도 안전
+
+### 삭제 경로와의 비대칭 재확인
+
+* 5절 `생성 vs 삭제 비대칭 설계` 표 참조
+* 핵심: 생성은 실패 원인이 클러스터 단위(쿼터·admission)인 경우가 많아 조기 중단이 유리 — 삭제는 Pod 단위 상태(Finalizer·`IsNotFound`)에 의존해 실패가 독립적이므로 병렬 처리가 적합
 
 ---
 
