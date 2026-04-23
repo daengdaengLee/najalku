@@ -1087,7 +1087,8 @@ default:
 
 ```go
 rs = rs.DeepCopy()
-newStatus := calculateStatus(rs, activePods, terminatingPods, manageReplicasErr, ...)
+now := rsc.clock.Now()
+newStatus := calculateStatus(rs, activePods, terminatingPods, manageReplicasErr, rsc.controllerFeatures, now)
 updatedRS, err := updateReplicaSetStatus(...)
 if err != nil { return err }
 
@@ -1124,9 +1125,12 @@ if manageReplicasErr != nil { return manageReplicasErr }
 
 #### 6단계 — MinReadySeconds 재동기화 예약
 
-> `pkg/controller/replicaset/replica_set.go:L844~855`
+> `pkg/controller/replicaset/replica_set.go:L822~824, L844~855`
 
 ```go
+now := rsc.clock.Now()
+newStatus := calculateStatus(rs, activePods, terminatingPods, manageReplicasErr, rsc.controllerFeatures, now)
+// ...
 if updatedRS.Spec.MinReadySeconds > 0 &&
     updatedRS.Status.ReadyReplicas != updatedRS.Status.AvailableReplicas {
     nextSyncDuration = ptr.To(time.Duration(updatedRS.Spec.MinReadySeconds) * time.Second)
@@ -1140,13 +1144,62 @@ if nextSyncDuration != nil {
 ```
 
 * `MinReadySeconds`: Pod가 Ready 상태로 N초 유지돼야 Available로 간주
+    * 타임라인 (MinReadySeconds=30 기준):
+        ```
+        T=0s        Pod-A Ready 전환           → syncReplicaSet 실행 → ReadyReplicas=1, AvailableReplicas=0
+        T=0~30s     Pod-A는 "Ready이지만 미 Available" 상태 (status 불일치)
+        T=30s       Pod-A Available 조건 충족 (시간 경과만으로)
+        T=30s 이후  syncReplicaSet이 다시 실행돼야 AvailableReplicas=1로 status 패치
+                   ← 이 재실행을 보장하기 위한 예약이 6단계의 핵심
+        ```
+    * 30초 구간 동안 status 갱신이 필요하지만 Pod 이벤트 없음 → 별도 재동기화 예약 필요
 * Ready지만 아직 Available 아닌 Pod 존재 → N초 후 재동기화 예약
 * 예약 없으면 Available 전환 시 Informer 이벤트가 없어 status 업데이트 누락 가능
-* `nextSyncDuration` 기본값: `MinReadySeconds * time.Second` — 최악 케이스 fallback
-* `FindMinNextPodAvailabilityCheck`: 각 active Pod의 Ready 전환 시점 기준으로 Available까지 남은 최소 시간 계산 → 더 정밀한 재동기화 타이밍
-    * 값을 반환하면 기본값 오버라이드 — Ready 전환 후 이미 경과한 시간을 반영하므로 기본값보다 짧거나 같음
+    * **주 경로** — 4.3의 `updatePod` 핸들러(L754~756): Pod NotReady→Ready 전환 시 `enqueueRSAfter(MinReadySeconds)`로 N초 후 재동기화 예약
+    * **6단계(안전망)** — 주 경로가 실패할 수 있는 구조적 제약 대비:
+        * **큐 키 경합**: RS에 여러 Pod이 있을 때 각 Pod의 `enqueueRSAfter`가 모두 **같은 RS 키**를 사용 → 타이머가 서로 덮어쓰거나 선점될 수 있음 (소스 주석 원문: `// we have one queue key for checking availability of all the pods`)
+        * 컨트롤러 재시작으로 예약 타이머 유실
+        * 이벤트 드롭·early sync (#39785)
+    * `syncReplicaSet`이 매 reconcile 종료 시점에 보강 예약 → 이중 안전장치
+    * 소스 주석: `// Plan the next availability check as a last line of defense against queue preemption ... or early sync` (L842~843) — 이벤트 드롭·큐 선점 상황 대비 안전장치
+* `now` 변수(L823)를 `calculateStatus`(L824)와 `FindMinNextPodAvailabilityCheck`(L849)에 **동일하게 전달**
+    * 의도: status 평가와 재동기화 타이밍 계산이 같은 기준 시각을 공유 → "status에서 미 Available로 집계한 Pod"와 "재동기화 예약이 필요한 Pod" 간 판정 일치
+    * 시나리오 (MinReadySeconds=30, Pod-A ReadyTime=09:59:40):
+        ```
+        [올바른 동작 — now 공유]
+        now = 10:00:00 (한 번 고정)
+          calculateStatus: Pod-A 미 Available (09:59:40 + 30s = 10:00:10 > 10:00:00)
+                        → AvailableReplicas에서 제외
+          FindMin:        10:00:10 − 10:00:00 = 10s → 10초 후 재동기화 예약
+          결과: 10:00:10경 reconcile → Pod-A Available 반영 → status 정확
 
----
+        [잘못된 동작 — now 불공유 가정]
+        calculateStatus(now=10:00:00): Pod-A 미 Available → AvailableReplicas 제외
+        FindMin(now=10:00:11):         10:00:10 − 10:00:11 = −1s → nil 반환
+                                      → fallback 30초 적용 → AddAfter at 10:00:11, duration=30s
+        결과: 10:00:41경 reconcile — 실제 필요 시각(10:00:10)보다 약 30초 지연
+             → 그 사이 availableReplicas status가 stale
+        ```
+    * ※ 실제 코드 경로상 `now` 두 읽기 간격은 μs 단위 — 위 11초 지연은 GC pause·극단 부하를 가정한 이론적 스트레스 시나리오. 공유 설계의 주 목적은 **판정 일관성 보증**이며, 실측 정밀도 향상은 부수 효과
+    * 소스 주석: `// Use the same time for calculating status and nextSyncDuration.` (L822), `// Use the same point in time (now) ... to get matching availability for the pods.` (L848)
+* `nextSyncDuration` 기본값: `MinReadySeconds * time.Second` — 최악 케이스 fallback
+* `FindMinNextPodAvailabilityCheck` — 더 정밀한 재동기화 타이밍 계산 (controller_utils.go:L1078)
+    * 1단계 `findMinNextPodAvailabilitySimpleCheck` — `lastOwnerStatusEvaluation`(= status 계산 시점 `now`) 기준으로 활성 Pod 중 가장 빨리 Available이 될 Pod와 남은 시간 선정
+    * 2단계 — 선정된 Pod에 대해 `clock.Now()`(실제 현재 시각)로 재계산 → 1단계와 이번 호출 사이의 지연 보정
+    * 2단계 결과가 nil (이미 Available 시점 지남) → `0` 반환 → 즉시 재동기화
+    * 값을 반환하면 기본값 오버라이드 — Ready 전환 후 이미 경과한 시간을 반영하므로 기본값보다 짧거나 같음
+    * 계산 예시 (MinReadySeconds=30, Pod-A ReadyTime=09:59:40, status 계산 now=10:00:00):
+        ```
+        1단계: findMinNextPodAvailabilitySimpleCheck(pods, 30s, lastOwnerStatusEvaluation=10:00:00)
+          Pod-A: 09:59:40 + 30s − 10:00:00 = 10s (양수, 후보)
+          → 선정: (Pod-A, 10s)
+
+        2단계: nextPodAvailabilityCheck(Pod-A, 30s, clock.Now()=10:00:00.005)
+          → 09:59:40 + 30s − 10:00:00.005 = 9.995s
+          → 반환: 9.995s
+
+        결과: queue.AddAfter(key, 9.995s) — fallback 30s 대신 정밀값 사용
+        ```
 
 ## 6. `slowStartBatch()` — 왜 한꺼번에 생성하지 않는가
 
