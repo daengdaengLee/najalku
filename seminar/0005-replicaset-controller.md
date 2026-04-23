@@ -1394,37 +1394,463 @@ func slowStartBatch(count int, initialBatchSize int, fn func() error) (int, erro
 * 5절 `생성 vs 삭제 비대칭 설계` 표 참조
 * 핵심: 생성은 실패 원인이 클러스터 단위(쿼터·admission)인 경우가 많아 조기 중단이 유리 — 삭제는 Pod 단위 상태(Finalizer·`IsNotFound`)에 의존해 실패가 독립적이므로 병렬 처리가 적합
 
----
-
 ## 7. 고아 파드 입양 & 삭제 대상 선정
+
+5절이 `syncReplicaSet`의 전체 Reconcile 흐름을 단계별로 추적했다면, 7절은 그 흐름 안에서 호출되는 두 의사결정 로직의 **내부**를 확대 분석. `claimPods` 호출은 5절 2단계, `getPodsToDelete` 호출은 5절 4단계 삭제 경로에서 이미 등장했고, 7절은 5절이 생략한 코드 디테일에 집중.
 
 ### 고아 파드 입양 (Orphan Adoption)
 
-* 고아 파드: `ownerReferences`가 없거나 owner가 사라진 파드
-* `getPodsForReplicaSet()` → `claimPods()` 흐름
-    * 셀렉터 매칭 확인
-    * ControllerRef 패치로 소유권 등록
+#### 1단계: "고아 파드"의 정의와 발생 경로
+
+* 고아 파드 = `metav1.GetControllerOfNoCopy(pod) == nil`, 즉 `controller: true`인 `ownerReference`가 없는 파드
+    * 실제 `ClaimObject`(`controller_ref_manager.go:L70`)에서 사용하는 함수는 `GetControllerOfNoCopy` — 복사 없이 포인터만 반환하는 경량 변형. apimachinery에는 복사본 반환 변형 `GetControllerOf`도 존재(`controller_ref.go:L34`)하지만 hot path에서는 No-Copy 사용
+* 고아 발생 경로:
+    * 사용자 수동 생성 (`kubectl run`, YAML apply)
+    * RS `--cascade=orphan` 삭제 → Pod는 남고 owner 사라짐
+    * 컨트롤러 레이스로 ownerReference 설정 실패
+
+#### 2단계: 호출 체인
+
+5절 2단계 `syncReplicaSet:L805`의 `rsc.claimPods(ctx, rs, selector, allActivePods)` 호출이 내부 분석의 진입점:
 
 ```
-ownerReferences 없는 파드
-  + 레이블이 RS 셀렉터와 일치
-  → ControllerRef 패치 → RS의 소유 파드로 편입
+syncReplicaSet (5절 2단계)
+  └─ rsc.claimPods()                    replica_set.go:L859
+      ├─ canAdoptFunc 생성 (RecheckDeletionTimestamp + UID 재확인)
+      ├─ NewPodControllerRefManager()   controller_ref_manager.go:L148
+      └─ cm.ClaimPods()                 controller_ref_manager.go:L183
+          └─ ClaimObject() (pod마다)    controller_ref_manager.go:L69
+              ├─ AdoptPod()             controller_ref_manager.go:L222
+              └─ ReleasePod()           controller_ref_manager.go:L238
 ```
 
-### 삭제 대상 선정 우선순위
+#### 3단계: `rsc.claimPods()` 상세
 
-* 스케일 다운 시 어떤 파드를 먼저 삭제할지 결정
-* `getPodsToDelete()` 내 정렬 기준
+> `pkg/controller/replicaset/replica_set.go:L859~L874`
 
-| 우선순위 (높을수록 먼저 삭제) | 조건                     |
-|-------------------|------------------------|
-| 1                 | 아직 노드에 스케줄되지 않은 파드     |
-| 2                 | Pending 상태 파드          |
-| 3                 | Ready 아닌 파드            |
-| 4                 | 같은 노드에 동일 RS 파드가 많은 경우 |
-| 5                 | Running / Ready 파드     |
+```go
+func (rsc *ReplicaSetController) claimPods(ctx context.Context, rs *apps.ReplicaSet, selector labels.Selector, filteredPods []*v1.Pod) ([]*v1.Pod, error) {
+	// If any adoptions are attempted, we should first recheck for deletion with
+	// an uncached quorum read sometime after listing Pods (see #42639).
+	canAdoptFunc := controller.RecheckDeletionTimestamp(func(ctx context.Context) (metav1.Object, error) {
+		fresh, err := rsc.kubeClient.AppsV1().ReplicaSets(rs.Namespace).Get(ctx, rs.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		if fresh.UID != rs.UID {
+			return nil, fmt.Errorf("original %v %v/%v is gone: got uid %v, wanted %v", rsc.Kind, rs.Namespace, rs.Name, fresh.UID, rs.UID)
+		}
+		return fresh, nil
+	})
+	cm := controller.NewPodControllerRefManager(rsc.podControl, rs, selector, rsc.GroupVersionKind, canAdoptFunc)
+	return cm.ClaimPods(ctx, filteredPods)
+}
+```
 
-* (상세 코드 분석 예정)
+* `canAdoptFunc` 클로저: API 서버에 **live GET**으로 RS 현재 상태 재조회 → **캐시가 아닌 quorum read** 사용 (소스 주석: "uncached quorum read", issue #42639 참조)
+* `fresh.UID != rs.UID` 검사: 같은 이름의 새 RS가 재생성된 경우 오래된 RS에 입양시키는 실수 방지
+* `RecheckDeletionTimestamp` (`controller_ref_manager.go:L391`): list 후 adopt 사이에 RS가 삭제되는 레이스 방지 — DeletionTimestamp 재확인 유틸
+
+#### 4단계: `PodControllerRefManager.ClaimPods()` — 루프
+
+> `pkg/controller/controller_ref_manager.go:L183~L218`
+
+```go
+func (m *PodControllerRefManager) ClaimPods(ctx context.Context, pods []*v1.Pod, filters ...func(*v1.Pod) bool) ([]*v1.Pod, error) {
+	var claimed []*v1.Pod
+	var errlist []error
+
+	match := func(obj metav1.Object) bool {
+		pod := obj.(*v1.Pod)
+		// Check selector first so filters only run on potentially matching Pods.
+		if !m.Selector.Matches(labels.Set(pod.Labels)) {
+			return false
+		}
+		for _, filter := range filters {
+			if !filter(pod) {
+				return false
+			}
+		}
+		return true
+	}
+	adopt := func(ctx context.Context, obj metav1.Object) error {
+		return m.AdoptPod(ctx, obj.(*v1.Pod))
+	}
+	release := func(ctx context.Context, obj metav1.Object) error {
+		return m.ReleasePod(ctx, obj.(*v1.Pod))
+	}
+
+	for _, pod := range pods {
+		ok, err := m.ClaimObject(ctx, pod, match, adopt, release)
+		if err != nil {
+			errlist = append(errlist, err)
+			continue
+		}
+		if ok {
+			claimed = append(claimed, pod)
+		}
+	}
+	return claimed, utilerrors.NewAggregate(errlist)
+}
+```
+
+* `match` 클로저: selector 매칭 + 선택적 필터 모두 통과해야 true
+* `adopt`/`release` 클로저는 `AdoptPod`/`ReleasePod` 호출 wrap
+* 에러는 `utilerrors.NewAggregate`로 묶어 반환 — 일부 Pod 입양 실패해도 나머지 계속 처리
+
+#### 5단계: `BaseControllerRefManager.ClaimObject()` — 핵심 분기
+
+> `pkg/controller/controller_ref_manager.go:L69~L128`
+
+```go
+func (m *BaseControllerRefManager) ClaimObject(ctx context.Context, obj metav1.Object, match func(metav1.Object) bool, adopt, release func(context.Context, metav1.Object) error) (bool, error) {
+	controllerRef := metav1.GetControllerOfNoCopy(obj)
+	if controllerRef != nil {
+		if controllerRef.UID != m.Controller.GetUID() {
+			// Owned by someone else. Ignore.
+			return false, nil
+		}
+		if match(obj) {
+			// We already own it and the selector matches.
+			// Return true (successfully claimed) before checking deletion timestamp.
+			// We're still allowed to claim things we already own while being deleted
+			// because doing so requires taking no actions.
+			return true, nil
+		}
+		// Owned by us but selector doesn't match.
+		// Try to release, unless we're being deleted.
+		if m.Controller.GetDeletionTimestamp() != nil {
+			return false, nil
+		}
+		if err := release(ctx, obj); err != nil {
+			if errors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		return false, nil
+	}
+
+	// It's an orphan.
+	if m.Controller.GetDeletionTimestamp() != nil || !match(obj) {
+		return false, nil
+	}
+	if obj.GetDeletionTimestamp() != nil {
+		return false, nil
+	}
+	if len(m.Controller.GetNamespace()) > 0 && m.Controller.GetNamespace() != obj.GetNamespace() {
+		return false, nil
+	}
+	if err := adopt(ctx, obj); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+```
+
+**결정 트리:**
+
+```
+controllerRef 존재?
+  ├─ YES
+  │    ├─ UID != rs.UID                             → false (다른 컨트롤러 소유, 무시)
+  │    ├─ UID == rs.UID + match                     → true  (이미 소유, 작업 없음)
+  │    ├─ UID == rs.UID + !match + RS 삭제 중       → false (skip)
+  │    └─ UID == rs.UID + !match + RS 살아 있음     → release → false
+  └─ NO (고아)
+       ├─ RS 삭제 중 or !match                      → false (무시)
+       ├─ Pod 삭제 중                               → false (무시)
+       ├─ 네임스페이스 불일치                        → false (무시)
+       └─ 모두 통과                                  → adopt → true
+```
+
+**설계 원칙:**
+
+* "이미 소유 + match" 분기는 deletion timestamp 체크 전에 return — 소스 주석 (L77~L81):
+  > "We're still allowed to claim things we already own while being deleted because doing so requires taking no actions."
+* 입양·방출 시점에만 `RS 삭제 중` 체크 — 죽어가는 RS가 추가 소유권 이전 작업을 하지 않도록
+
+#### 6단계: `AdoptPod()` / `ReleasePod()` — PATCH 내부
+
+> `pkg/controller/controller_ref_manager.go:L222~L264`
+
+```go
+func (m *PodControllerRefManager) AdoptPod(ctx context.Context, pod *v1.Pod) error {
+	if err := m.CanAdopt(ctx); err != nil {
+		return fmt.Errorf("can't adopt Pod %v/%v (%v): %v", pod.Namespace, pod.Name, pod.UID, err)
+	}
+	// Note that ValidateOwnerReferences() will reject this patch if another
+	// OwnerReference exists with controller=true.
+	patchBytes, err := ownerRefControllerPatch(m.Controller, m.controllerKind, pod.UID, m.finalizers...)
+	if err != nil {
+		return err
+	}
+	return m.podControl.PatchPod(ctx, pod.Namespace, pod.Name, patchBytes)
+}
+
+func (m *PodControllerRefManager) ReleasePod(ctx context.Context, pod *v1.Pod) error {
+	// ...
+	patchBytes, err := GenerateDeleteOwnerRefStrategicMergeBytes(pod.UID, []types.UID{m.Controller.GetUID()}, m.finalizers...)
+	if err != nil {
+		return err
+	}
+	err = m.podControl.PatchPod(ctx, pod.Namespace, pod.Name, patchBytes)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// If the pod no longer exists, ignore it.
+			return nil
+		}
+		if errors.IsInvalid(err) {
+			// Invalid error will be returned in two cases: 1. the pod
+			// has no owner reference, 2. the uid of the pod doesn't
+			// match, which means the pod is deleted and then recreated.
+			// In both cases, the error can be ignored.
+			return nil
+		}
+	}
+	return err
+}
+```
+
+**`AdoptPod`:**
+
+* `m.CanAdopt(ctx)` 먼저 호출 — `sync.Once`로 한 매니저 인스턴스당 1회만 실행 (`controller_ref_manager.go:L45~L52`)
+* **에러 캐싱**: 한 번 실행된 `CanAdoptFunc`의 결과(`canAdoptErr`)는 인스턴스에 저장 → 같은 `syncReplicaSet` 내 모든 후속 `AdoptPod` 호출이 같은 에러로 실패(all-or-nothing). 새 sync pass에서는 새 매니저가 만들어지므로 재시도 가능
+* `ownerRefControllerPatch`로 strategic merge patch 바이트 생성 후 `podControl.PatchPod` 호출
+* 이미 `controller=true`인 ownerReference가 있으면 API 서버의 `ValidateOwnerReferences`가 거절 — 서버가 보장
+
+**`ReleasePod`:**
+
+* `GenerateDeleteOwnerRefStrategicMergeBytes`로 특정 UID의 owner ref만 제거하는 패치
+* `IsNotFound`, `IsInvalid` 모두 무시 — 둘 다 "이미 목표 달성 상태"로 해석:
+    * NotFound: Pod가 이미 삭제 → 소유권 해제 목적 달성
+    * Invalid: ownerReference가 없거나 UID 불일치 → 이미 해제됨
+
+#### 7단계: 시나리오 — 고아 Pod 입양 타임라인
+
+상황: 사용자가 `kubectl label pod my-pod app=web`으로 고아 Pod를 RS 셀렉터에 매칭되도록 레이블 변경
+
+```
+T0: Pod에 ownerReference 없음, labels={app:web}
+T1: Pod Informer Update 이벤트 → updatePod 핸들러 (5절 updatePod 참조)
+    → 고아 + labelChanged → rsc.getPodReplicaSets(curPod) → 매칭 RS들 enqueue
+T2: syncReplicaSet 실행 → 2단계에서 allActivePods에 이 Pod 포함
+T3: claimPods 호출 → canAdoptFunc 최초 1회 실행 → RS 살아 있음 확인
+T4: ClaimObject → 고아 + match + RS 살아 있음 + Pod 살아 있음 → adopt
+T5: AdoptPod → PATCH ownerReferences (controller=true, UID=rs.UID)
+T6: 반환된 Pod 목록에 포함되어 diff 계산에 반영
+```
+
+### 삭제 대상 선정 우선순위 (Delete Selection)
+
+#### 1단계: 호출 맥락
+
+5절 4단계 삭제 경로에서 호출 (`replica_set.go:L710`):
+
+```go
+podsToDelete := getPodsToDelete(activePods, relatedPods, diff)
+```
+
+* `activePods`: 이 RS가 소유하고 active한 Pod (`claimPods` 반환값)
+* `relatedPods`: `getIndirectlyRelatedPods` 반환값 — "같은 owner(Deployment 등) 아래 형제 RS의 Pod 포함"
+* 5절에서 `relatedPods`의 역할은 "노드별 분포 계산"이라고만 언급 — 이 절에서 왜 형제 RS 파드를 고려하는가를 풀어 설명
+
+#### 2단계: `getIndirectlyRelatedPods()` — 왜 형제 RS까지 보는가
+
+> `pkg/controller/replicaset/replica_set.go:L913~L939`
+
+```go
+func (rsc *ReplicaSetController) getIndirectlyRelatedPods(logger klog.Logger, rs *apps.ReplicaSet) ([]*v1.Pod, error) {
+	var relatedPods []*v1.Pod
+	seen := make(map[types.UID]*apps.ReplicaSet)
+	for _, relatedRS := range rsc.getReplicaSetsWithSameController(logger, rs) {
+		selector, err := metav1.LabelSelectorAsSelector(relatedRS.Spec.Selector)
+		if err != nil {
+			continue
+		}
+		pods, err := rsc.podLister.Pods(relatedRS.Namespace).List(selector)
+		if err != nil {
+			return nil, err
+		}
+		for _, pod := range pods {
+			if _, found := seen[pod.UID]; found {
+				continue
+			}
+			seen[pod.UID] = relatedRS
+			relatedPods = append(relatedPods, pod)
+		}
+	}
+	return relatedPods, nil
+}
+```
+
+* 롤링 업데이트 중에는 같은 Deployment 아래 old RS와 new RS가 공존
+* old RS 스케일 다운 시, new RS 파드가 많이 몰린 노드의 old 파드를 우선 삭제 → 노드 간 파드 분포 균등 유지
+* `seen` 맵으로 UID 중복 제거 — 여러 RS에 매칭되는 Pod 대비
+
+#### 3단계: `getPodsToDelete()` — 정렬 + 슬라이싱
+
+> `pkg/controller/replicaset/replica_set.go:L941~L950`
+
+```go
+func getPodsToDelete(filteredPods, relatedPods []*v1.Pod, diff int) []*v1.Pod {
+	// No need to sort pods if we are about to delete all of them.
+	// diff will always be <= len(filteredPods), so not need to handle > case.
+	if diff < len(filteredPods) {
+		podsWithRanks := getPodsRankedByRelatedPodsOnSameNode(filteredPods, relatedPods)
+		sort.Sort(podsWithRanks)
+		reportSortingDeletionAgeRatioMetric(filteredPods, diff)
+	}
+	return filteredPods[:diff]
+}
+```
+
+* `diff >= len(filteredPods)` 시 정렬 생략 — 어차피 전부 삭제할 거면 순서 무관
+* `getPodsRankedByRelatedPodsOnSameNode`로 랭크 부여 → `sort.Sort` → `filteredPods[:diff]` 슬라이싱
+* `reportSortingDeletionAgeRatioMetric`: 삭제 대상 ready 파드의 "나이 비율"을 메트릭으로 기록 (운영 관찰용)
+
+#### 4단계: `getPodsRankedByRelatedPodsOnSameNode()` — 랭크 계산
+
+> `pkg/controller/replicaset/replica_set.go:L972~L988`
+
+```go
+func getPodsRankedByRelatedPodsOnSameNode(podsToRank, relatedPods []*v1.Pod) controller.ActivePodsWithRanks {
+	podsOnNode := make(map[string]int)
+	for _, pod := range relatedPods {
+		if controller.IsPodActive(pod) {
+			podsOnNode[pod.Spec.NodeName]++
+		}
+	}
+	ranks := make([]int, len(podsToRank))
+	for i, pod := range podsToRank {
+		ranks[i] = podsOnNode[pod.Spec.NodeName]
+	}
+	return controller.ActivePodsWithRanks{Pods: podsToRank, Rank: ranks, Now: metav1.Now()}
+}
+```
+
+* `podsOnNode`: `relatedPods` 중 **active**한 파드 수를 노드별로 집계
+* `ranks[i] = podsOnNode[pod.Spec.NodeName]`: 각 Pod의 랭크 = 그 Pod가 있는 노드의 "형제 active Pod 수"
+* 랭크가 **높을수록 먼저 삭제** — 같은 노드에 파드가 많이 몰린 쪽에서 먼저 뽑아냄
+
+#### 5단계: `ActivePodsWithRanks.Less()` — 8단계 비교 규칙
+
+> `pkg/controller/controller_utils.go:L843~L917`
+
+```go
+func (s ActivePodsWithRanks) Less(i, j int) bool {
+	// 1. Unassigned < assigned
+	if s.Pods[i].Spec.NodeName != s.Pods[j].Spec.NodeName && (len(s.Pods[i].Spec.NodeName) == 0 || len(s.Pods[j].Spec.NodeName) == 0) {
+		return len(s.Pods[i].Spec.NodeName) == 0
+	}
+	// 2. PodPending < PodUnknown < PodRunning
+	if podPhaseToOrdinal[s.Pods[i].Status.Phase] != podPhaseToOrdinal[s.Pods[j].Status.Phase] {
+		return podPhaseToOrdinal[s.Pods[i].Status.Phase] < podPhaseToOrdinal[s.Pods[j].Status.Phase]
+	}
+	// 3. Not ready < ready
+	if podutil.IsPodReady(s.Pods[i]) != podutil.IsPodReady(s.Pods[j]) {
+		return !podutil.IsPodReady(s.Pods[i])
+	}
+	// 4. lower pod-deletion-cost < higher pod-deletion cost
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodDeletionCost) {
+		pi, _ := helper.GetDeletionCostFromPodAnnotations(s.Pods[i].Annotations)
+		pj, _ := helper.GetDeletionCostFromPodAnnotations(s.Pods[j].Annotations)
+		if pi != pj {
+			return pi < pj
+		}
+	}
+	// 5. Doubled up < not doubled up
+	if s.Rank[i] != s.Rank[j] {
+		return s.Rank[i] > s.Rank[j]
+	}
+	// TODO: take availability into account when we push minReadySeconds information from deployment into pods,
+	//       see https://github.com/kubernetes/kubernetes/issues/22065
+	// 6. Been ready for empty time < less time < more time
+	if podutil.IsPodReady(s.Pods[i]) && podutil.IsPodReady(s.Pods[j]) {
+		readyTime1 := podReadyTime(s.Pods[i])
+		readyTime2 := podReadyTime(s.Pods[j])
+		if !readyTime1.Equal(readyTime2) {
+			if !utilfeature.DefaultFeatureGate.Enabled(features.LogarithmicScaleDown) {
+				return afterOrZero(readyTime1, readyTime2)
+			} else {
+				// ...로그 스케일 비교 + UID 타이브레이커...
+				rankDiff := logarithmicRankDiff(*readyTime1, *readyTime2, s.Now)
+				if rankDiff == 0 {
+					return s.Pods[i].UID < s.Pods[j].UID
+				}
+				return rankDiff < 0
+			}
+		}
+	}
+	// 7. Pods with containers with higher restart counts < lower restart counts
+	if res := compareMaxContainerRestarts(s.Pods[i], s.Pods[j]); res != nil {
+		return *res
+	}
+	// 8. Empty creation time pods < newer pods < older pods
+	if !s.Pods[i].CreationTimestamp.Equal(&s.Pods[j].CreationTimestamp) {
+		if !utilfeature.DefaultFeatureGate.Enabled(features.LogarithmicScaleDown) {
+			return afterOrZero(&s.Pods[i].CreationTimestamp, &s.Pods[j].CreationTimestamp)
+		} else {
+			// ...로그 스케일 비교 + UID 타이브레이커...
+			rankDiff := logarithmicRankDiff(s.Pods[i].CreationTimestamp, s.Pods[j].CreationTimestamp, s.Now)
+			if rankDiff == 0 {
+				return s.Pods[i].UID < s.Pods[j].UID
+			}
+			return rankDiff < 0
+		}
+	}
+	return false
+}
+```
+
+**완전한 우선순위 표 (8개, 기존 표 5개 → 완전화):**
+
+| # | 조건                                                               | 설계 의도                             |
+|---|------------------------------------------------------------------|-----------------------------------|
+| 1 | 노드 미배정 먼저                                                        | 스케줄 실패 중인 파드 우선 제거                |
+| 2 | Pending < Unknown < Running                                      | 시작 단계 파드 우선 (`podPhaseToOrdinal`) |
+| 3 | NotReady 먼저                                                      | 가용성 보호                            |
+| 4 | `pod-deletion-cost` 낮은 값 먼저 (`PodDeletionCost` feature gate)     | 사용자 힌트 — 낮은 비용 파드 우선 삭제           |
+| 5 | 랭크 **높은** 쪽 먼저 (`s.Rank[i] > s.Rank[j]`)                         | 같은 노드 쏠림 해소 (4단계 랭크)              |
+| 6 | Ready 시간 짧은 파드 먼저 (`LogarithmicScaleDown` 시 로그 스케일 + UID 타이브레이커) | 막 Ready된 파드 우선                    |
+| 7 | 컨테이너 재시작 횟수 많은 파드 먼저                                             | 불안정 파드 우선                         |
+| 8 | 생성 시간 짧은 파드 먼저 (로그 스케일 + UID 타이브레이커)                             | 새로 만든 파드 우선                       |
+
+**핵심 설계 포인트:**
+
+* **`pod-deletion-cost` (#4)**: `controller.kubernetes.io/pod-deletion-cost=<int>` 어노테이션으로 값이 낮은 파드를 먼저 삭제 — 캐시가 warm한 파드에 높은 비용을 붙여 보존하는 용도
+* **랭크 방향성 (#5)**: `s.Rank[i] > s.Rank[j]` → 랭크가 큰 쪽(더 몰린 노드)이 먼저 — "몰린 노드에서 덜어낸다"는 의도와 부호 방향 일치
+* **로그 스케일 타이브레이크 (#6, #8)**: `LogarithmicScaleDown` feature gate — 시간 차이가 작을수록 동점 처리, UID 기반 pseudorandom 타이브레이크 → 결정론적이면서 공평
+* **TODO 주석 (#5~#6 사이)**: `issues/22065` — 향후 `minReadySeconds` 정보가 Pod에 내려오면 가용성도 고려 예정
+
+#### 6단계: 시나리오 — 롤링 업데이트 중 스케일 다운
+
+상황: 3-node 클러스터, Deployment replicas=6 → 4로 축소
+
+| RS         | Pods         | 노드    |
+|------------|--------------|-------|
+| RS-old(v1) | Pod-A, Pod-B | node1 |
+| RS-old(v1) | Pod-C        | node2 |
+| RS-new(v2) | Pod-D        | node1 |
+| RS-new(v2) | Pod-E        | node2 |
+| RS-new(v2) | Pod-F        | node3 |
+
+RS-old에서 3→1로 축소(2개 삭제) 시점:
+
+* `relatedPods` = 6개 (RS-old + RS-new 모두) → `podsOnNode = {node1: 3, node2: 2, node3: 1}`
+* `activePods` = RS-old 3개, 각 랭크: Pod-A(node1)→3, Pod-B(node1)→3, Pod-C(node2)→2
+* 8단계 비교: 1~3단계 동점 → 4단계(cost 어노테이션 없음) 동점 → **5단계 랭크 결정** → A(3), B(3) > C(2)
+* `sort.Sort` → `filteredPods[:2]` → **Pod-A, Pod-B 삭제**
+
+삭제 전후 노드 분포:
+
+* 전: node1=3 (A,B,D), node2=2 (C,E), node3=1 (F)
+* 후: node1=1 (D), node2=2 (C,E), node3=1 (F) — 전체 6 → 4, node1이 가장 크게 감소
+
+→ 롤링 업데이트 중에도 각 노드에 파드가 균등 분포 유지
 
 ---
 
