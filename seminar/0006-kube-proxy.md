@@ -234,3 +234,25 @@ Pod B (10.244.0.5) 수신 → 처리 → 응답
 * kube-proxy는 §2.1 Phase 3에서 한 번 규칙을 심으면 트래픽 경로에서 빠짐 → 모든 패킷은 **커널이 직접** 처리
 * 이 성질이 iptables 모드의 빠른 데이터플레인의 근거 — 그러나 동시에 한계의 근원이기도 함(아래에서 상세 설명)
 * 이후 각 단계를 자세히 분석
+
+---
+
+## 3. 사전 학습 — 전제 개념
+
+### 3.1 Service 추상
+
+kube-proxy 관점에서 Service는 "어떤 포트로 들어온 트래픽을 어떤 Pod 집합으로 분산할지"를 선언하는 명세다.
+
+* **ClusterIP**: 클러스터 내부에서만 유효한 가상 IP — 노드마다 iptables DNAT 규칙 생성
+* **NodePort**: ClusterIP에 더해, 모든 노드의 특정 포트도 진입점으로 추가
+* **LoadBalancer**: NodePort에 더해, 외부 LB가 붙여준 IP도 진입점으로 추가
+* **Headless (`clusterIP: None`)**: 가상 IP 없음 → kube-proxy 규칙 **미생성**, DNS가 Pod IP 목록을 직접 반환
+  * 클라이언트가 특정 Pod를 골라야 할 때 (예: StatefulSet)
+  * 클라이언트가 직접 부하 분산할 때 (예: gRPC long-lived connection)
+* **ExternalName**: CNAME 리다이렉트 — kube-proxy 규칙 **미생성**
+  * 외부 DNS를 클러스터 내부 이름으로 포장 — 외부 서비스를 내부 서비스처럼 사용
+
+**핵심**
+
+* ClusterIP는 아무 인터페이스에도 없는 주소 → 패킷이 커널을 통과할 때 NAT으로 목적지를 바꿔치기해야만 도달 가능
+* 이 역할이 kube-proxy(iptables 모드)에서는 **DNAT 규칙**으로 구현됨
