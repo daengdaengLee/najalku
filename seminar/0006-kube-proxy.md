@@ -115,9 +115,12 @@ API Server ───── EndpointSlice 생성/업데이트
       backends: [10.244.0.5:8080]
  │
  ▼  syncProxyRules() 실행
-    (iptables-restore 로 커널에 일괄 적용)
+    (iptables-restore 로 규칙 일괄 적용)
 
-[node-1 커널 iptables nat 테이블]
+[node-1 커널 iptables (nat 테이블)]
+
+  PREROUTING / OUTPUT 체인
+    └── KUBE-SERVICES 로 점프
 
   KUBE-SERVICES 체인
     └── dst == 10.96.15.42:80  →  KUBE-SVC-XXXX로 이동
