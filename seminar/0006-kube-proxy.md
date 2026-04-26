@@ -1,9 +1,9 @@
 # kube-proxy: Service 가상 IP를 커널 규칙으로 실체화하기
 
-## ClusterIP 패킷은 어떻게 Pod에 도달하는가 — kube-proxy 역할과 핵심 동작 분석
+## ClusterIP 패킷은 어떻게 Pod에 도달하는가 - kube-proxy 역할과 핵심 동작 분석
 
-> * **대주제:** k8s 네트워크 스택
-> * **중주제:** kube-proxy (iptables 모드 중심)
+* **대주제:** k8s 네트워크 스택
+* **중주제:** kube-proxy (iptables 모드 중심)
 
 ---
 
@@ -23,21 +23,21 @@
 
 ## 1. 핵심 한 줄 요약
 
-> **"Service의 가상 IP를 노드 커널 규칙으로 실체화한다"**
+**"Service의 가상 IP를 노드 커널 규칙으로 실체화"**
 
-* ClusterIP(`10.96.0.1`)는 어떤 네트워크 인터페이스에도 할당되지 않은 **가상 주소**
-* 그 주소로 보낸 패킷을 실제 Pod IP로 DNAT 해주는 것이 kube-proxy의 핵심
-* Service/EndpointSlice 변경을 감시 → 노드의 iptables(또는 ipvs/nftables) 규칙 갱신
+kube-proxy가 무엇을 하고 무엇을 하지 않는지, 인접 컴포넌트와의 분담을 한눈에 보여준다.
 
-| 하는 것                                   | 하지 않는 것 (다른 컴포넌트 책임)                             |
-|----------------------------------------|--------------------------------------------------|
-| ClusterIP·NodePort → Pod IP DNAT 규칙 생성 | Pod IP 할당 (→ CNI)                                |
-| Service·EndpointSlice 변경 감지 → 규칙 동기화   | EndpointSlice 생성/유지 (→ EndpointSlice Controller) |
-| 노드 전체 iptables 규칙 일괄 재생성               | L7 HTTP 라우팅 (→ Ingress / Gateway)                |
-| LoadBalancer·ExternalIP·NodePort 포함    | NetworkPolicy 시행 (→ CNI 플러그인)                    |
-| Headless Service / ExternalName 스킵     | DNS 해석 (→ CoreDNS)                               |
-
-> `pkg/proxy/doc.go:17` — `// Package proxy implements the layer-3 network proxy.`
+| 기능                                                             | 담당                           | 설명                                                                                                                                                                          |
+|----------------------------------------------------------------|------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| ClusterIP·NodePort·LoadBalancer·ExternalIP → Pod IP DNAT 규칙 생성 | **kube-proxy**               | 가상 IP로 들어온 패킷의 목적지를 실제 Pod IP:port로 바꾸는 iptables DNAT 규칙 생성                                                                                                                 |
+| 노드 전체 iptables 규칙 일괄 재생성                                       | **kube-proxy**               | Service·EndpointSlice 변경을 watch해 트리거됨. Service 하나가 바뀌어도 KUBE-SERVICES, KUBE-SVC-\*, KUBE-SEP-\* 체인이 연쇄 영향을 받으므로, 부분 수정 대신 항상 전체 상태를 기준으로 규칙을 재구성해 `iptables-restore`로 일괄 적용 |
+| Headless Service 스킵                                            | **kube-proxy** (규칙 미생성)      | `clusterIP: None`이라 가상 IP 없음 → DNAT 규칙 불필요. Service Informer의 FieldSelector(`spec.clusterIP!=None`)로 **수신 단계에서 제외**                                                         |
+| ExternalName Service 스킵                                        | **kube-proxy** (규칙 미생성)      | DNS CNAME 리다이렉트라 가상 IP 없음. FieldSelector로는 걸러지지 않고 **kube-proxy 내부에서 Service 타입을 보고 무시** (DNS는 CoreDNS가 처리)                                                                 |
+| Pod IP 할당·네트워크 인터페이스 생성                                        | CNI 플러그인                     | kubelet이 CRI 런타임을 통해 sandbox를 만들면, **CRI 런타임이 CNI 플러그인을 호출**해 Pod 네트워크 네임스페이스에 인터페이스(예: veth)와 IP를 구성. kube-proxy는 이미 할당된 IP를 EndpointSlice에서 읽어 쓸 뿐                        |
+| EndpointSlice 생성·유지                                            | EndpointSlice Controller     | Service selector에 매칭되는 Pod들을 endpoint로 등록하되, 각 endpoint에 `ready`/`serving`/`terminating` **condition을 표기**. kube-proxy는 이를 소비해 `ready=true`인 endpoint만 부하 분산 후보로 사용         |
+| L7 HTTP 라우팅                                                    | Ingress / Gateway Controller | 컨트롤러가 L7 라우팅 규칙을 데이터플레인 프록시에 구성하고, **실제 라우팅(경로·헤더·호스트)은 데이터플레인 프록시(Envoy, NGINX 등)가 수행**. kube-proxy는 IP·포트 수준(L3/L4)만 처리                                                   |
+| NetworkPolicy 시행                                               | CNI 플러그인                     | Pod 간 접근 제어 규칙 시행. Calico·Cilium 등이 별도 커널 규칙(iptables 또는 eBPF)으로 처리                                                                                                         |
+| DNS 해석                                                         | CoreDNS                      | `my-svc.default.svc.cluster.local` → ClusterIP 변환. Headless Service는 **EndpointSlice를 참조해 Pod IP들을 A/AAAA 레코드로 직접 반환** (named port는 SRV로 제공)                                |
 
 ---
 
@@ -128,7 +128,7 @@ API Server ───── EndpointSlice 생성/업데이트
     └── dst == 10.96.15.42:80  →  KUBE-SVC-XXXX로 이동
 
   KUBE-SVC-XXXX 체인  (부하 분산 — Pod가 여러 개면 확률 분배)
-    └── 100%  →  KUBE-SEP-YYYY로 이동
+    └── 100%  →  KUBE-SEP-YYYY로 이동   (※ Pod 1개 가정)
 
   KUBE-SEP-YYYY 체인  (실제 DNAT)
     └── 목적지를 10.244.0.5:8080 으로 바꿈
@@ -202,20 +202,24 @@ Pod B (10.244.0.5) 수신 → 응답
 ```
 진입점
  │
- ├── Case A (내부): OUTPUT 훅   → KUBE-SERVICES       ─┐
- └── Case B (외부): PREROUTING  → KUBE-NODEPORTS       ─┘
-                                                        │
-                                              (여기서 합류)
-                                                        ▼
-                                              KUBE-SVC-XXXX
-                                               (부하 분산)
-                                                        │
-                                                        ▼
-                                              KUBE-SEP-YYYY
-                                               (DNAT 실행)
-                                                        │
-                                                        ▼
-                                                     Pod 도달
+ ├── Case A (내부): OUTPUT      ─┐
+ └── Case B (외부): PREROUTING  ─┘
+                                 │
+                                 ▼
+                          KUBE-SERVICES
+                       (공통 진입 — ClusterIP면 직행,
+                        NodePort면 KUBE-NODEPORTS 경유)
+                                 │
+                                 ▼
+                          KUBE-SVC-XXXX
+                           (부하 분산)
+                                 │
+                                 ▼
+                          KUBE-SEP-YYYY
+                           (DNAT 실행)
+                                 │
+                                 ▼
+                              Pod 도달
 ```
 
 ### 2.3 핵심 인사이트
