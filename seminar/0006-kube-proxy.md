@@ -314,3 +314,8 @@ iptables DNAT 규칙 매칭
 * 두 훅 의미: `PREROUTING`은 **네트워크 인터페이스로 수신된** 패킷이 라우팅되기 전, `OUTPUT`은 **호스트 네트워크 네임스페이스의 프로세스**(kubelet, kube-proxy 등)가 직접 생성한 패킷. 일반 Pod 트래픽은 자체 네임스페이스의 veth 로 나가 PREROUTING 경로로 들어옴. 어느 경로든 동일한 KUBE-* 규칙 셋을 거침
 * 응답 패킷의 역방향 복원(un-DNAT)은 커널 **Conntrack**(연결 추적)이 자동 처리 — kube-proxy 규칙은 단방향만 정의하면 됨
 * kube-proxy는 `iptables-restore`로 규칙 셋만 동기화 — 실제 패킷 변환은 **커널 netfilter가 수행**
+
+### 3.4 Informer + Reconcile 패턴 (0005 복습)
+
+* 0005에서 배운 `SharedIndexInformer` → `EventHandler` → `WorkQueue` → `Reconcile` 패턴이 kube-proxy에서도 동일하게 쓰임
+* **차이**: kube-proxy는 per-key WorkQueue 대신 `BoundedFrequencyRunner` 사용 → 뒤쪽 섹션에서 자세히
