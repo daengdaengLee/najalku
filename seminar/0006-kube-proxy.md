@@ -292,3 +292,25 @@ kube-proxy
 * EndpointSlice는 producer(Controller) ↔ consumer(kube-proxy) 사이의 **계약**
 * Controller는 "Pod가 살아있고 트래픽 받을 수 있는가?" 를 condition에 기록
 * kube-proxy는 그 condition만 보고 iptables DNAT 후보 결정 — Pod 오브젝트는 직접 watch하지 않음
+
+### 3.3 Linux netfilter / DNAT
+
+* 리눅스 커널의 **netfilter** 프레임워크 위에 **iptables** 규칙이 동작
+* `nat` 테이블의 `PREROUTING` / `OUTPUT` 훅에서 목적지 IP를 바꾸는 것이 **DNAT**
+* kube-proxy는 `iptables-restore` 명령으로 이 규칙 셋을 커널에 일괄 적용
+
+```
+패킷 (dest: ClusterIP:80)
+  │
+  ▼ PREROUTING / OUTPUT (nat table)
+iptables DNAT 규칙 매칭
+  │
+  ▼
+패킷 (dest: PodIP:8080)  ──► Pod
+```
+
+**핵심**
+
+* 두 훅 의미: `PREROUTING`은 **네트워크 인터페이스로 수신된** 패킷이 라우팅되기 전, `OUTPUT`은 **호스트 네트워크 네임스페이스의 프로세스**(kubelet, kube-proxy 등)가 직접 생성한 패킷. 일반 Pod 트래픽은 자체 네임스페이스의 veth 로 나가 PREROUTING 경로로 들어옴. 어느 경로든 동일한 KUBE-* 규칙 셋을 거침
+* 응답 패킷의 역방향 복원(un-DNAT)은 커널 **Conntrack**(연결 추적)이 자동 처리 — kube-proxy 규칙은 단방향만 정의하면 됨
+* kube-proxy는 `iptables-restore`로 규칙 셋만 동기화 — 실제 패킷 변환은 **커널 netfilter가 수행**
