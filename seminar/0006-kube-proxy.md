@@ -418,9 +418,14 @@ main()                                              cmd/kube-proxy/proxy.go:29
 
 **핵심**
 
-* `(*ProxyServer).Run` 안에서 두 가지가 결선됨: ① Informer factory + Config + `RegisterEventHandler` 로 **이벤트 수신 경로 구축**, ② `go s.Proxier.SyncLoop()` 로 **소비 루프 기동**
-* 두 InformerFactory 는 TweakListOptions 로 Headless·proxy-name 객체를 **사전 필터링** — 메커니즘은 비대칭: EndpointSlice 는 LabelSelector 단독(`service.kubernetes.io/headless` 부재), Service 는 LabelSelector + FieldSelector(`service.kubernetes.io/service-proxy-name` 부재 + `spec.clusterIP != None`)
-* 비대칭 이유: EndpointSlice 는 컨트롤러가 Headless 슬라이스에 레이블을 명시적으로 붙이지만, Service 자체에는 그런 레이블이 없어 `spec.clusterIP` 필드로 직접 걸러야 함 (앞 절 Headless 처리와 연결)
+* `(*ProxyServer).Run` 안에서 두 가지가 결선됨:
+  1. Informer factory + Config + `RegisterEventHandler` 로 **이벤트 수신 경로 구축**
+  2. `go s.Proxier.SyncLoop()` 로 **소비 루프 기동**
+* 두 InformerFactory 는 TweakListOptions 로 Headless·proxy-name 객체를 **사전 필터링**
+  * 메커니즘은 비대칭:
+    * EndpointSlice 는 LabelSelector 단독(`service.kubernetes.io/headless` 부재)
+    * Service 는 LabelSelector + FieldSelector(`service.kubernetes.io/service-proxy-name` 부재 + `spec.clusterIP != None`)
+  * 비대칭 이유: EndpointSlice 는 컨트롤러가 Headless 슬라이스에 레이블을 명시적으로 붙이지만, Service 자체에는 그런 레이블이 없어 `spec.clusterIP` 필드로 직접 걸러야 함 (앞 절 Headless 처리와 연결)
 
 ### 4.2 이벤트 → syncProxyRules 호출 체인
 
