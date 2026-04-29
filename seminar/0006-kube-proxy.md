@@ -36,6 +36,25 @@
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 전제: kube-proxy 배포 위상
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[컨트롤 플레인]              [워커 노드 A]           [워커 노드 B]
+ API Server                  kube-proxy Pod           kube-proxy Pod
+     ▲                            │ watch                   │ watch
+     ├────────────────────────────┘                         │
+     └──────────────────────────────────────────────────────┘
+     │
+ EndpointSlice Controller ──► EndpointSlice 저장
+     (kube-proxy 가 동일하게 watch)
+
+ • DaemonSet — 모든 노드에 1 Pod (kube-system 네임스페이스)
+ • 컨트롤 플레인 ✗  데이터 플레인 ✓  자기 노드 iptables 만 관리
+ • 노드 간 kube-proxy 직접 통신 없음 — API Server 경유 동기화
+
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  Phase 1: Pod 생성 → IP 할당
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -124,6 +143,27 @@ API Server ───── EndpointSlice 생성/업데이트
 
   KUBE-SEP-YYYY 체인  (실제 DNAT)
     └── 목적지를 10.244.0.5:8080 으로 바꿈
+
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ Phase 3.1: kube-proxy 내부 동작 한눈에
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+kube-proxy 프로세스 (각 노드에서 실행 중)
+ │
+ ├── watch ──► API Server
+ │               ├─ Service
+ │               ├─ EndpointSlice
+ │               ├─ Node
+ │               └─ ServiceCIDR
+ │
+ ▼  변경 감지 시
+    BoundedFrequencyRunner 가 짧은 시간 내 변경 묶어 코얼레싱
+ │
+ └── syncProxyRules() 실행
+      └── iptables-restore 로 규칙 일괄 적용
+           (앞 Phase 3 의 KUBE-* 체인 갱신)
 ```
 
 ### 2.2 패킷 흐름 — 외부/내부 → Pod
@@ -243,6 +283,7 @@ Pod B (10.244.0.5) 수신 → 처리 → 응답
 ### 2.3 핵심 인사이트
 
 * 설정 흐름(§2.1)과 실행 흐름(§2.2)은 **완전히 분리**됨
+* 노드별 kube-proxy 는 자기 노드 규칙만 관리 — 노드 간 직접 통신 없이 API Server 가 유일한 동기화 허브
 * kube-proxy는 §2.1 Phase 3에서 한 번 규칙을 심으면 트래픽 경로에서 빠짐 → 모든 패킷은 **커널이 직접** 처리
 * 단 iptables 규칙 매칭은 선형 비용(O(n)) — 대규모 Service/Endpoint 에서는 한계(IPVS·eBPF 모드 대비, 뒤쪽 섹션에서 상세)
 * 이후 각 단계를 자세히 분석
