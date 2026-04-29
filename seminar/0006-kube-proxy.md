@@ -12,6 +12,7 @@
 1. 핵심 한 줄 요약
 2. 전체 그림 한눈에 보기
 3. 사전 학습 — 전제 개념
+4. reconcile 루프 — 이벤트에서 iptables 규칙까지
 
 ---
 
@@ -372,4 +373,167 @@ iptables DNAT 규칙 매칭
 ### 3.4 Informer + Reconcile 패턴 (0005 복습)
 
 * 0005에서 배운 `SharedIndexInformer` → `EventHandler` → `WorkQueue` → `Reconcile` 패턴이 kube-proxy에서도 동일하게 쓰임
-* **차이**: kube-proxy는 per-key WorkQueue 대신 `BoundedFrequencyRunner` 사용 → 뒤쪽 섹션에서 자세히
+* **차이**: kube-proxy는 per-key WorkQueue 대신 `BoundedFrequencyRunner` 사용 → 뒤 절에서 자세히
+
+---
+
+## 4. reconcile 루프 — 이벤트에서 iptables 규칙까지
+
+앞 절에서 예고한 Informer + Reconcile 패턴의 실제 구현체. 세 흐름을 순서대로 분해한다.
+
+* **§4.1** kube-proxy 가 시작될 때 watch 등록과 핸들러 결선이 어떻게 이루어지는가
+* **§4.2** Informer 이벤트가 올라왔을 때 `syncProxyRules` 호출에 이르기까지의 호출 체인
+* **§4.3** `syncProxyRules` 내부에서 어떤 계산이 일어나 iptables 규칙이 갱신되는가
+* **§4.4** `BoundedFrequencyRunner` 가 이벤트 폭주를 어떻게 제어하는가
+
+### 4.1 watch 등록과 핸들러 결선
+
+`main()` 진입부터 Informer 결선·핸들러 등록·SyncLoop 기동까지 한 트리.
+
+```
+main()                                              cmd/kube-proxy/proxy.go:29
+  └─ app.NewProxyCommand()                          cmd/kube-proxy/app/server.go:98
+      └─ Cobra RunE                                 server.go:110
+          └─ opts.Run(ctx)                          options.go:361   (호출 지점 server.go:133)
+              ├─ newProxyServer(...)                server.go:181    (Proxier·NodeManager 등 구성)
+              └─ opts.runLoop(ctx)                  options.go:388
+                  └─ go o.proxyServer.Run(ctx)      options.go:395
+                      └─ (s *ProxyServer).Run       server.go:526
+                          ├─ Headless/proxy-name 필터용 LabelSelector 준비
+                          │     ├─ noHeadlessEndpoints                 server.go:568
+                          │     └─ noProxyName                         server.go:563
+                          ├─ endpointSliceInformerFactory 생성         server.go:580
+                          │    └─ LabelSelector !service.kubernetes.io/headless
+                          │                                            server.go:582
+                          ├─ serviceInformerFactory 생성               server.go:590
+                          │    ├─ LabelSelector !service.kubernetes.io/service-proxy-name
+                          │    │                                       server.go:592
+                          │    └─ FieldSelector spec.clusterIP != None server.go:593
+                          ├─ NewServiceConfig + RegisterEventHandler(s.Proxier)
+                          │                                            server.go:595, 596
+                          ├─ NewEndpointSliceConfig + RegisterEventHandler(s.Proxier)
+                          │                                            server.go:599, 600
+                          └─ go s.Proxier.SyncLoop()                   server.go:627
+```
+
+**핵심**
+
+* `(*ProxyServer).Run` 안에서 두 가지가 결선됨: ① Informer factory + Config + `RegisterEventHandler` 로 **이벤트 수신 경로 구축**, ② `go s.Proxier.SyncLoop()` 로 **소비 루프 기동**
+* 두 InformerFactory 는 TweakListOptions 로 Headless·proxy-name 객체를 **사전 필터링** — 메커니즘은 비대칭: EndpointSlice 는 LabelSelector 단독(`service.kubernetes.io/headless` 부재), Service 는 LabelSelector + FieldSelector(`service.kubernetes.io/service-proxy-name` 부재 + `spec.clusterIP != None`)
+* 비대칭 이유: EndpointSlice 는 컨트롤러가 Headless 슬라이스에 레이블을 명시적으로 붙이지만, Service 자체에는 그런 레이블이 없어 `spec.clusterIP` 필드로 직접 걸러야 함 (앞 절 Headless 처리와 연결)
+
+### 4.2 이벤트 → syncProxyRules 호출 체인
+
+Informer 가 변경 이벤트를 내보낸 시점부터 `syncProxyRules` 가 실행되기까지. Service 와 EndpointSlice 는 코드 구조가 비대칭이므로 분리해서 본다.
+
+**[Service 경로] — Add/Delete 가 OnServiceUpdate 로 위임되어 한 깔때기로 합류**
+
+```
+Informer EventHandler (cache.ResourceEventHandlerFuncs)              config/config.go:179
+  ├─ handleAddService            config/config.go:212
+  │    └─ OnServiceAdd (Proxier 디스패치 config.go:220)               iptables/proxier.go:461
+  │         └─ proxier.OnServiceUpdate(nil, service)                 iptables/proxier.go:462
+  ├─ handleUpdateService         config/config.go:224
+  │    └─ OnServiceUpdate (디스패치 config.go:237)                    iptables/proxier.go:467
+  └─ handleDeleteService         config/config.go:241
+       └─ OnServiceDelete (디스패치 config.go:256)                    iptables/proxier.go:475
+            └─ proxier.OnServiceUpdate(service, nil)                 iptables/proxier.go:476
+
+  (세 경로 모두 OnServiceUpdate 로 합류)
+  proxier.OnServiceUpdate                                            iptables/proxier.go:467
+    ├─ proxier.serviceChanges.Update — 변경 델타를 트래커에 누적         servicechangetracker.go:76
+    └─ proxier.Sync()                                                iptables/proxier.go:426
+        └─ proxier.syncRunner.Run()                                  iptables/proxier.go:431
+```
+
+**[EndpointSlice 경로] — Add/Update/Delete 가 각각 독립 호출 (위임 없음)**
+
+```
+Informer EventHandler (cache.ResourceEventHandlerFuncs)              config/config.go:85
+  ├─ handleAddEndpointSlice       config/config.go:118
+  │    └─ OnEndpointSliceAdd (디스패치 config.go:126)                 iptables/proxier.go:494
+  │         ├─ endpointsChanges.EndpointSliceUpdate(slice, false)    endpointschangetracker.go:81
+  │         └─ proxier.Sync()                                        iptables/proxier.go:426
+  ├─ handleUpdateEndpointSlice    config/config.go:130
+  │    └─ OnEndpointSliceUpdate (디스패치 config.go:143)              iptables/proxier.go:502
+  │         ├─ endpointsChanges.EndpointSliceUpdate(slice, false)    endpointschangetracker.go:81
+  │         └─ proxier.Sync()                                        iptables/proxier.go:426
+  └─ handleDeleteEndpointSlice    config/config.go:147
+       └─ OnEndpointSliceDelete (디스패치 config.go:162)              iptables/proxier.go:510
+            ├─ endpointsChanges.EndpointSliceUpdate(slice, true)     endpointschangetracker.go:81
+            └─ proxier.Sync()                                        iptables/proxier.go:426
+```
+
+**[소비 측 — 독립 고루틴]**
+
+```
+go s.Proxier.SyncLoop()                                              server.go:627
+  └─ proxier.SyncLoop()                                              iptables/proxier.go:435
+      └─ proxier.syncRunner.Loop(...)                                iptables/proxier.go:443
+          └─ BoundedFrequencyRunner.Loop                             runner/bounded_frequency_runner.go:89
+              └─ (트리거 조건 만족 시 fn 실행)
+                  fn = proxier.syncProxyRules  — wiring              iptables/proxier.go:312
+                  proxier.syncProxyRules()                           iptables/proxier.go:638
+```
+
+**핵심**
+
+* Service 경로는 OnServiceAdd → `OnServiceUpdate(nil, svc)`, OnServiceDelete → `OnServiceUpdate(svc, nil)` 로 위임돼 **세 경로가 OnServiceUpdate 한 점에 합류** — Update 만 봐도 전체 로직 파악 가능
+* EndpointSlice 경로는 위임 없이 **세 메서드가 각자 endpointsChanges.EndpointSliceUpdate 와 Sync 를 직접 호출** — Delete 만 `removeSlice=true` 로 차이
+* 핸들러 콜백은 **트래커에 델타만 누적**하고 즉시 리턴 — 무거운 iptables 작업은 하지 않음
+* `Sync()` 호출은 러너에 "할 일 있음" 신호만 보내는 것. producer(이벤트 핸들러) ↔ consumer(syncProxyRules) 가 트래커·러너로 디커플링됨
+
+### 4.3 syncProxyRules() 내부 — 누적 변경 적용 + 규칙 재생성
+
+호출된 다음 함수 내부에서 어떤 계산이 일어나는가.
+
+```
+syncProxyRules()                                        iptables/proxier.go:638
+  │
+  ├─ doFullSync 결정                                    iptables/proxier.go:651
+  │    = needFullSync || (now - lastFullSync > FullSyncPeriod[1h])
+  │
+  ├─ svcPortMap.Update(serviceChanges)                  iptables/proxier.go:663
+  │    └─ 트래커에 누적된 Service 델타를 머티리얼라이즈드 맵에 적용
+  │       (ServicePortMap.Update — servicechangetracker.go:168)
+  │
+  ├─ endpointsMap.Update(endpointsChanges)              iptables/proxier.go:664
+  │    └─ 트래커에 누적된 EndpointSlice 델타를 머티리얼라이즈드 맵에 적용
+  │
+  ├─ KUBE-SERVICES / KUBE-NODEPORTS / KUBE-SVC-* / KUBE-SEP-* 체인 재생성
+  │    ├─ doFullSync == true  → 전체 Service 처음부터 재구성
+  │    └─ doFullSync == false → 변경된 Service 만 갱신    iptables/proxier.go:1078
+  │         (needFullSync 는 OnTopologyChange·forceSyncProxyRules 경로에서 set
+  │          proxier.go:532, 629)
+  │
+  └─ iptables-restore 로 커널에 일괄 적용
+```
+
+**핵심**
+
+* 첫 두 단계(`*Map.Update(*Changes)`) 가 핵심 — 호출이 끝나면 트래커는 비워지고 머티리얼라이즈드 맵이 "현재 시점의 desired state" 가 됨
+* 이후 규칙 재생성은 **풀 동기화**와 **부분 동기화** 두 모드 — 평소엔 변경된 Service 집합만 갱신, `needFullSync=true` 또는 마지막 풀 싱크 후 1시간 경과 시에만 전체 재구성
+* 어느 모드든 최종 결과는 `iptables-restore` 단일 호출로 커널에 일괄 적용
+* 풀 동기화가 필요한 이유: KUBE-SERVICES → KUBE-SVC-* → KUBE-SEP-* 체인이 연쇄 영향을 받을 수 있고, 누락된 이벤트가 있어도 1시간마다 강제 풀 동기화로 결국 수렴
+
+### 4.4 BoundedFrequencyRunner — 빈도 제어와 코얼레싱
+
+앞 절 호출 체인의 "트리거 조건 만족 시 fn 실행" 박스를 한 단계 더 풀면.
+
+```
+BoundedFrequencyRunner                                 runner/bounded_frequency_runner.go:29
+  ├─ NewBoundedFrequencyRunner(name, fn, minInterval, retryInterval, maxInterval)
+  │     fn            = proxier.syncProxyRules        iptables/proxier.go:312
+  │     minInterval   = MinSyncPeriod   (기본 1초)     ← 이벤트 폭주 시 bursting 방지
+  │     retryInterval = SyncPeriod      (기본 30초)    ← fn 이 error 리턴 시 재시도 간격
+  │     maxInterval   = FullSyncPeriod  (1시간, 상수)  ← 변경 없어도 강제 호출 상한
+  ├─ Run()  — 외부에서 "할 일 있음" 신호               bounded_frequency_runner.go:149
+  └─ Loop() — 신호·타이머에 따라 fn 한 번 실행          bounded_frequency_runner.go:89
+```
+
+**핵심**
+
+* `minInterval` (1초): 직전 실행 후 이 시간 안에는 다시 실행하지 않음 → 이벤트 폭주 시 자연스러운 코얼레싱
+* `retryInterval` (30초): `--iptables-sync-period` 플래그로 노출됨. fn 이 error 를 리턴했을 때만 적용되는 재시도 간격 — 정상 상황에서의 주기적 sync 간격이 아님 (자주 혼동되는 지점)
+* `maxInterval` (1시간): `proxyutil.FullSyncPeriod` 상수. 변경이 없어도 1시간마다 fn 호출 보장 → 누락된 이벤트가 있어도 결국 수렴. 이 상수는 `syncProxyRules` 내부에서도 partial vs full sync 분기 임계값으로 재사용됨 (위 절 참조)
+* per-key WorkQueue 대신 이 방식인 이유: reconcile 단위가 "특정 Service 1개" 가 아니라 "노드 전체 규칙 셋" 이라 키 단위 분할이 의미 없음 — 빈도 제어 + 코얼레싱만 있으면 충분
