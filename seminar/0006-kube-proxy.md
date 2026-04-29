@@ -46,7 +46,7 @@
      └──────────────────────────────────────────────────────┘
      │
  EndpointSlice Controller ──► EndpointSlice 저장
-     (kube-proxy 가 동일하게 watch)
+                         (kube-proxy 가 동일하게 watch)
 
  • DaemonSet — 모든 노드에 1 Pod (kube-system 네임스페이스)
  • 컨트롤 플레인 ✗  데이터 플레인 ✓  자기 노드 iptables 만 관리
@@ -284,7 +284,7 @@ Pod B (10.244.0.5) 수신 → 처리 → 응답
 
 * 설정 흐름(§2.1)과 실행 흐름(§2.2)은 **완전히 분리**됨
 * 노드별 kube-proxy 는 자기 노드 규칙만 관리 — 노드 간 직접 통신 없이 API Server 가 유일한 동기화 허브
-* kube-proxy는 §2.1 Phase 3에서 한 번 규칙을 심으면 트래픽 경로에서 빠짐 → 모든 패킷은 **커널이 직접** 처리
+* kube-proxy는 iptables에 한 번 규칙을 심으면 트래픽 경로에서 빠짐 → 모든 패킷은 **커널이 직접** 처리
 * 단 iptables 규칙 매칭은 선형 비용(O(n)) — 대규모 Service/Endpoint 에서는 한계(IPVS·eBPF 모드 대비, 뒤쪽 섹션에서 상세)
 * 이후 각 단계를 자세히 분석
 
