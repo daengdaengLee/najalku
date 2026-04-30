@@ -13,6 +13,7 @@
 2. 전체 그림 한눈에 보기
 3. 사전 학습 — 전제 개념
 4. reconcile 루프 — 이벤트에서 iptables 규칙까지
+5. iptables 모드의 한계와 다음 다리
 
 ---
 
@@ -606,3 +607,55 @@ BoundedFrequencyRunner                                 runner/bounded_frequency_
 * `retryInterval` (30초): `--iptables-sync-period` 플래그로 노출됨. fn 이 error 를 리턴했을 때만 적용되는 재시도 간격 — 정상 상황에서의 주기적 sync 간격이 아님 (자주 혼동되는 지점)
 * `maxInterval` (1시간): `proxyutil.FullSyncPeriod` 상수. 변경이 없어도 1시간마다 fn 호출 보장 → 누락된 이벤트가 있어도 결국 수렴. 이 상수는 `syncProxyRules` 내부에서도 partial vs full sync 분기 임계값으로 재사용됨 (위 절 참조)
 * per-key WorkQueue 대신 이 방식인 이유: reconcile 단위가 "특정 Service 1개" 가 아니라 "노드 전체 규칙 셋" 이라 키 단위 분할이 의미 없음 — 빈도 제어 + 코얼레싱만 있으면 충분
+
+**ReplicaSet Controller 와의 비교**
+
+|              | ReplicaSet Controller    | kube-proxy                                |
+|--------------|--------------------------|-------------------------------------------|
+| 감시 대상        | ReplicaSet, Pod          | Service, EndpointSlice, Node, ServiceCIDR |
+| 큐 방식         | per-key WorkQueue        | 없음 → `BoundedFrequencyRunner`             |
+| Reconcile 단위 | 키(`namespace/name`) 1 개  | 노드 전체 iptables 규칙 셋                       |
+| 트리거          | `processNextWorkItem` 루프 | `OnXxxUpdate` 콜백 → `Sync()` 신호            |
+| 빈도 제어        | rate-limited 재시도 backoff | `minSyncPeriod` ~ `FullSyncPeriod`        |
+| Reconcile 함수 | `syncReplicaSet(key)`    | `syncProxyRules()` (키 인자 없음)              |
+
+* ReplicaSet 은 키 1 개 = 한 ReplicaSet 의 Pod 수 조정 — 변경 영향이 키 단위로 깔끔히 분리됨
+* kube-proxy 는 Service 1 개가 바뀌어도 KUBE-SERVICES / KUBE-SVC-XXXX / KUBE-SEP-XXXX 체인이 연쇄로 영향 → 키 단위 부분 수정보다 전체 재생성 + `iptables-restore` 일괄 적용이 더 단순·안전
+* 그래서 "어떤 키가 바뀌었나" 추적하는 WorkQueue 보다 "지금 전체 상태가 무엇인가" 로 풀 동기화하는 BoundedFrequencyRunner 가 자연스러운 선택
+
+---
+
+## 5. iptables 모드의 한계와 다음 다리
+
+지금까지 분석한 iptables 모드는 동작은 하지만, kube-proxy 자체가 가진 모드는 이게 전부가 아니고 장기적으로 다른 방향이 권장됨. 다음 시리즈 (Cilium / eBPF) 로의 다리를 놓기 위해 이 절을 둠.
+
+### 5.1 모드 선택지
+
+> `cmd/kube-proxy/app/options.go:130`, `server_linux.go:47-49 / 128 / 178 / 245`
+
+| 모드            | 플랫폼        | 특성                                                                                      |
+|---------------|------------|-----------------------------------------------------------------------------------------|
+| `iptables`    | Linux (기본) | netfilter nat 테이블에 KUBE-* 체인으로 규칙 작성. 본 세미나 대상                                          |
+| `ipvs`        | Linux      | 커널 IPVS (L4 LB) 로 부하 분산. **현재 deprecated** (`server_linux.go:187-188` 경고) — nftables 권장 |
+| `nftables`    | Linux      | iptables 후속 규칙 체계. set 기반 매칭으로 더 효율적                                                    |
+| `kernelspace` | Windows    | Windows HNS (Host Networking Service) 기반                                                |
+
+* 빈 값일 때 Linux 기본값 = `iptables` (`server_linux.go:47-49`)
+* 모드별 진입점 = `iptables.NewProxier()` / `ipvs.NewProxier()` / `nftables.NewProxier()` (모두 같은 `Provider` 인터페이스 구현)
+
+### 5.2 iptables 모드의 한계
+
+* **규칙 수 O(n)** — Service 1 개당 룰 수 = `1 + N` (KUBE-SVC 1 개 + KUBE-SEP × N 엔드포인트). 클러스터 전체로는 `∑(1 + Nᵢ)` 의 **선형 누적** — Service·엔드포인트가 늘면 규칙 수도 같은 비율로 늘어남
+* **순차 매칭** — netfilter 는 체인 안 룰을 위에서 아래로 순회. 규모가 커질수록 패킷 처리 비용도 비례 증가
+* **부하 분산이 확률 룰** — `-m statistic --probability` 의 역순 동전 던지기로 균등 분배 (앞 절 §4.3.2). N 변경 시 룰 전체를 다시 써야 균등이 유지됨
+* **풀 동기화 비용** — partial sync 가 있어도 (앞 절 §4.3.3) 1 시간 강제 풀 동기화 (`FullSyncPeriod`) 시점이나 큰 변경 시점에 노드 전체 룰 셋을 재생성·재적용
+* **디버깅 난이도** — `iptables-save -t nat | grep KUBE-` 출력에서 KUBE-SERVICES → KUBE-SVC-XXXX → KUBE-SEP-XXXX 점프를 사람이 손으로 따라가야 함
+
+### 5.3 다음 시리즈 — Cilium / eBPF
+
+* `ipvs` deprecated 경고 (`server_linux.go:187-188`): "*Please use 'nftables' instead.*" — 단기 대안은 nftables 모드
+* 더 큰 흐름: **kube-proxy 자체를 대체** 하는 데이터플레인. eBPF 가 커널 훅 지점에서 직접 부하 분산 / NAT 을 수행 → KUBE-* iptables 룰 셋이 사라짐
+* 0007+ Cilium 시리즈 예고:
+  * kube-proxy replacement (Cilium 측 플래그 `--kube-proxy-replacement=true`)
+  * NetworkPolicy 시행 (현 kube-proxy 가 하지 않는 영역)
+  * Hubble 옵저버빌리티
