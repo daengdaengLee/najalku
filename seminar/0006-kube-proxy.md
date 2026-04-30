@@ -651,11 +651,7 @@ BoundedFrequencyRunner                                 runner/bounded_frequency_
 * **풀 동기화 비용** — partial sync 가 있어도 (앞 절 §4.3.3) 1 시간 강제 풀 동기화 (`FullSyncPeriod`) 시점이나 큰 변경 시점에 노드 전체 룰 셋을 재생성·재적용
 * **디버깅 난이도** — `iptables-save -t nat | grep KUBE-` 출력에서 KUBE-SERVICES → KUBE-SVC-XXXX → KUBE-SEP-XXXX 점프를 사람이 손으로 따라가야 함
 
-### 5.3 다음 시리즈 — Cilium / eBPF
+### 5.3 대안과 미래 — Cilium / eBPF
 
 * `ipvs` deprecated 경고 (`server_linux.go:187-188`): "*Please use 'nftables' instead.*" — 단기 대안은 nftables 모드
-* 더 큰 흐름: **kube-proxy 자체를 대체** 하는 데이터플레인. eBPF 가 커널 훅 지점에서 직접 부하 분산 / NAT 을 수행 → KUBE-* iptables 룰 셋이 사라짐
-* 0007+ Cilium 시리즈 예고:
-  * kube-proxy replacement (Cilium 측 플래그 `--kube-proxy-replacement=true`)
-  * NetworkPolicy 시행 (현 kube-proxy 가 하지 않는 영역)
-  * Hubble 옵저버빌리티
+* 더 큰 흐름: **kube-proxy 자체를 대체** 하는 데이터플레인. eBPF(e.g., Cilium) 가 커널 훅 지점에서 직접 부하 분산 / NAT 을 수행 → KUBE-* iptables 룰 셋이 사라짐
