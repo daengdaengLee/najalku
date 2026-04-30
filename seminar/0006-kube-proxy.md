@@ -505,21 +505,85 @@ syncProxyRules()                                        iptables/proxier.go:638
   ├─ endpointsMap.Update(endpointsChanges)              iptables/proxier.go:664
   │    └─ 트래커에 누적된 EndpointSlice 델타를 머티리얼라이즈드 맵에 적용
   │
-  ├─ KUBE-SERVICES / KUBE-NODEPORTS / KUBE-SVC-* / KUBE-SEP-* 체인 재생성
-  │    ├─ doFullSync == true  → 전체 Service 처음부터 재구성
-  │    └─ doFullSync == false → 변경된 Service 만 갱신    iptables/proxier.go:1078
-  │         (needFullSync 는 OnTopologyChange·forceSyncProxyRules 경로에서 set
-  │          proxier.go:532, 629)
+  ├─ 4 개 LineBuffer reset                               iptables/proxier.go:732
+  │    (filterChains/Rules, natChains/Rules)
   │
-  └─ iptables-restore 로 커널에 일괄 적용
+  ├─ 톱-레벨 체인 라인 작성                              iptables/proxier.go:741
+  │    (KUBE-SERVICES/NODEPORTS/POSTROUTING/MARK-MASQ …)
+  │
+  ├─ 서비스 루프: 각 svc → SVC/EXT/FW/SEP 체인 라인 누적  iptables/proxier.go:827
+  │
+  └─ iptables-restore 일괄 적용 (NoFlushTables)          iptables/proxier.go:1377
 ```
 
 **핵심**
 
 * 첫 두 단계(`*Map.Update(*Changes)`) 가 핵심 — 호출이 끝나면 트래커는 비워지고 머티리얼라이즈드 맵이 "현재 시점의 desired state" 가 됨
-* 이후 규칙 재생성은 **풀 동기화**와 **부분 동기화** 두 모드 — 평소엔 변경된 Service 집합만 갱신, `needFullSync=true` 또는 마지막 풀 싱크 후 1시간 경과 시에만 전체 재구성
 * 어느 모드든 최종 결과는 `iptables-restore` 단일 호출로 커널에 일괄 적용
 * 풀 동기화가 필요한 이유: KUBE-SERVICES → KUBE-SVC-* → KUBE-SEP-* 체인이 연쇄 영향을 받을 수 있고, 누락된 이벤트가 있어도 1시간마다 강제 풀 동기화로 결국 수렴
+
+#### 4.3.1 체인 이름은 어떻게 만들어지나
+
+> `sha256(servicePortName + protocol)` → base32 → **앞 16자**
+
+```
+servicePortName = "default/web:http"
+protocol        = "tcp"
+                        │
+                        ▼  sha256 → base32 → [:16]
+                  "ABCDEFGHIJKLMNOP"
+                        │
+        ┌───────────────┼────────────────┐
+        ▼               ▼                ▼
+  KUBE-SVC-AB...    KUBE-EXT-AB...   KUBE-FW-AB...   ← 같은 16자 해시 재사용
+                    (조건부)         (조건부)
+
+  KUBE-SEP- 만 입력에 endpoint 가 추가됨:
+    sha256(servicePortName + protocol + "10.244.0.5:8080") → base32 → [:16]
+```
+
+* iptables 체인명 **28자 제한** 안에 들어가도록 해시를 16자로 절단 (prefix `KUBE-SVC-` 등 + 16자 ≈ 24~25자)
+* SVC 는 항상 생성, **EXT/FW 는 조건부** — EXT 는 외부 진입점(NodePort/LoadBalancer/ExternalIP) 이 있을 때, FW 는 `LoadBalancerSourceRanges` 가 설정됐을 때만
+* `iptables/proxier.go:542-594` (`portProtoHash`, `servicePortPolicyClusterChain`, `servicePortEndpointChainName`)
+
+#### 4.3.2 부하 분산 확률 — 역순 동전 던지기
+
+> N 개 엔드포인트, i 번째 룰 확률 = `1/(N-i)` (마지막은 매처 없이 무조건 매칭)
+
+```
+N = 3 일 때:
+  rule 0: -m statistic --probability 1/3   → KUBE-SEP-EP0
+  rule 1: -m statistic --probability 1/2   → KUBE-SEP-EP1
+  rule 2: (조건 없음, default)              → KUBE-SEP-EP2
+
+  실제 도달 확률
+    EP0:        1/3
+    EP1: 2/3 × 1/2 = 1/3
+    EP2: 2/3 × 1/2 = 1/3   ← 균등 1/3 보장
+```
+
+* `-m statistic` 은 룰 단위 독립 검사 → 누적 통과 확률을 보정해야 함 → "역순 동전 던지기" 는 본 문서 편의상 명명
+* 세션 어피니티(`sessionAffinity: ClientIP`) 면 분배 룰 **앞** 에 각 EP 마다 `-m recent --rcheck` 줄이 끼어 같은 클라이언트는 같은 EP 로 직행. 매칭된 클라이언트 등록(`--set`) 은 SEP 체인 안에서 수행
+* `iptables/proxier.go:403-405` (`computeProbability`), `iptables/proxier.go:1444-1488` (어피니티 + 분배 루프)
+
+#### 4.3.3 Partial sync 가 어떻게 절약되나
+
+```
+서비스 루프 본문 시작부                                 iptables/proxier.go:1078
+  if !doFullSync
+     && svcName ∉ serviceUpdateResult.UpdatedServices
+     && svcName ∉ endpointUpdateResult.UpdatedServices {
+       natChains = skippedNatChains   ← DiscardLineBuffer 로 스왑
+       natRules  = skippedNatRules    ← 메트릭 카운팅만, 출력 버려짐
+  }
+
+  → iptables-restore 입력에 변경 없는 서비스의 SVC-/SEP- 체인 포함되지 않음
+  → NoFlushTables(--noflush) 옵션이라 커널의 기존 룰 그대로 보존
+```
+
+* 풀 동기화 시에는 `iptablesJumpChains` 루프(상위 체인으로의 점프 보장) 도 함께 도는데, partial sync 는 이걸 건너뛰어 **20번의 `/sbin/iptables` 호출 절약** (작가 주석)
+* `iptables/proxier.go:685-723` (점프 룰 ensure: full sync 전용), `iptables/proxier.go:1078-1081` (디스카드 버퍼 스왑)
+* 같은 동기화에서 작성되는 부속 값 — `KUBE-MARK-MASQ` 가 OR 마킹하는 비트 = `1 << masqueradeBit` (기본 14 → `0x4000`) `iptables/proxier.go:262-264`. 마킹·POSTROUTING 흐름의 의미·이유는 앞 절 (외부→NodePort MASQUERADE 케이스 / netfilter·DNAT 사전 학습) 에서 다룸
 
 ### 4.4 BoundedFrequencyRunner — 빈도 제어와 코얼레싱
 
