@@ -4,3 +4,6 @@
 [submodule "kubernetes"]
 	path = kubernetes
 	url = https://github.com/daengdaengLee/kubernetes.git
+[submodule "cilium"]
+	path = cilium
+	url = https://github.com/cilium/cilium.git
