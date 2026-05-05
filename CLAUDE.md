@@ -27,7 +27,8 @@ Seminar documents are written in Korean.
 - Write in complete sentences, organized into paragraphs that build a logical argument
 - Use cause-and-effect connectors actively: 따라서, 그 결과, 그러나, 그래서, 즉
 - Bullet points are reserved for genuinely list-like content (enumerations of equal-weight items, sequential steps); do not use bullets to fragment continuous reasoning
-- Sentence endings: full polite/declarative endings (e.g., -다/-이다/-한다); do not use noun-terminal or 함/음 endings
+- Register: write in formal polite style (격식체 존댓말); use -ㅂ니다/-습니다 endings for statements
+- Sentence endings: full polite endings (e.g., -ㅂ니다/-습니다/-입니다); do not use plain-style (-다/-이다/-한다), noun-terminal, or 함/음 endings
 - Do not use bold, italic, or blockquote for emphasis or structuring
 
 ### Visuals and Tables
