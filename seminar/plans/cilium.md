@@ -158,8 +158,8 @@
 
 ## 진행
 
-- [ ] 유닛 1: eBPF 기초
-- [ ] 유닛 2: eBPF 훅 부착 지점 상세 (XDP / tc / socket)
+- [x] 유닛 1: eBPF 기초
+- [x] 유닛 2: eBPF 훅 부착 지점 상세 (XDP / tc / socket)
 - [ ] 유닛 3: Cilium 아키텍처
 - [ ] 유닛 4: Cilium Service LB (ClusterIP)
 - [ ] 유닛 5: 실습 설치+검증 (kind)
