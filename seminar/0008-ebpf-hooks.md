@@ -57,7 +57,7 @@ XDP 가 반환할 수 있는 액션은 네 가지입니다.
 - `XDP_TX`: 같은 NIC 로 패킷을 되돌려 보냅니다.
 - `XDP_REDIRECT`: 다른 NIC 또는 다른 CPU 로 패킷을 전달합니다.
 
-Cilium 은 XDP 의 빠른 위치를 부하 분산 가속 경로에 활용합니다. 구체적인 LB 시나리오는 이후 Service LB 세션에서 다룹니다.
+Cilium 은 XDP 의 빠른 위치를 부하 분산 가속 경로에 활용합니다. XDP BPF 프로그램이 `xdp_md` 의 raw 바이트를 직접 파싱해 BPF 맵에서 백엔드를 조회한 뒤 목적지를 재작성하고 `XDP_REDIRECT` 로 내보내는 방식으로, `sk_buff` 할당과 스택 진입 없이 NAT 와 동등한 결과를 냅니다. 구체적인 LB 시나리오는 이후 Service LB 세션에서 다룹니다.
 
 ### tc ingress/egress — `sk_buff` 단위
 
@@ -98,10 +98,6 @@ Cilium 은 이 자리를 socket-LB 에 활용합니다. Pod 가 `connect(Cluster
 - XDP 자리에서는 패킷이 스택에 진입하기 전에 부하 분산 결정을 끝냅니다.
 - tc 자리에서는 `sk_buff` 단위로 보안 정책 집행과 NAT·포워딩을 처리합니다.
 - socket 자리에서는 패킷을 만들기 전에 ClusterIP 를 백엔드 IP 로 바꿔치기합니다.
-
-### 본 세션이 답하지 않은 것
-
-이 문서는 세 훅의 부착 위치와 처리 권한 차이까지만 다뤘고, 다음 항목들은 의도적으로 미뤘습니다. kprobe, uprobe, tracepoint, cgroup 의 다른 변형, LSM 같은 다른 유형의 eBPF 훅은 0007 의 한 줄 언급에서 더 나아가지 않았습니다. tc 훅과 Envoy 를 연결하는 L7 리다이렉트, BPF map 의 실제 키 구조, 각 훅에 부착된 BPF C 프로그램의 코드 경로도 본 세션의 범위 밖입니다. Cilium 의 컴포넌트가 어떻게 이 훅들을 관리하는지는 다음 세션의 주제입니다.
 
 ### 다음 다리 — Cilium 아키텍처 개요
 
