@@ -116,4 +116,4 @@ Cilium 은 이 자리를 socket-LB 에 활용합니다. Pod 가 `connect(Cluster
 | 부착 위치 | NIC 드라이버 직후, `sk_buff` 생성 전 | 디바이스의 qdisc·class·filter 위, `sk_buff` 단위 | cgroup v2, `connect()`/`sendmsg()` 등 시스템 콜 시점 |
 | 컨텍스트 | `xdp_md` (raw 바이트 포인터) | `__sk_buff` (`sk_buff` 메타데이터) | `bpf_sock_addr` 등 (소켓이 결정한 목적지 메타데이터) |
 | 결정 권한 | `XDP_DROP` / `XDP_PASS` / `XDP_TX` / `XDP_REDIRECT` | `TC_ACT_OK` / `TC_ACT_SHOT` / `TC_ACT_REDIRECT` | 패킷 NAT 가 아닌 destination rewrite |
-| Cilium 활용 | 부하 분산 가속 경로 | L3/L4 보안 정책 집행 | socket-LB |
+| Cilium 활용 | 부하 분산 가속 경로 | L3/L4 보안 정책 집행, NAT·포워딩 | socket-LB |
