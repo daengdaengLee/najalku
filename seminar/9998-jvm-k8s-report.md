@@ -60,8 +60,9 @@ cpu request   350m   →  200m    실측 per-pod 사용량 122~157m. 현재 2배
 cpu limit     700m   →  700m    유지(또는 1000m). 1000m도 JVM은 1 CPU 동일,
                               throttle 여유만 늘어남. 2000m은 비권장*
 cpu target     60%   →   60%    request 정상화만으로 100 RPS가 6~7파드로 수렴
-mem req=limit 750Mi  →  측정 후  request==limit 유지(Guaranteed QoS).
-                              절대값은 NMT native 피크로 재산정
+mem req=limit 750Mi  →  측정 후  request==limit 유지. 절대값은 NMT native 피크로 재산정.
+                              QoS는 Burstable(CPU req≠limit). mem usage가 req(=limit)를
+                              못 넘어 노드 압박 시 우선 축출 대상에선 빠짐
 HPA memory      없음  →   없음    추가 금지 (ratchet으로 scale-in 영구 차단)
 ```
 
@@ -154,8 +155,9 @@ Q6. 죽었다면 무엇으로?  (재시작 시)
   ├ mem request=limit 상향 (ops 협의, 절대값 = heap+native피크+마진)
   ├ MaxRAMPercentage 하향(예 60→50) → 힙 줄여 native 여유 확보(단 GC압력↑)
   └ CPU target 하향 → 파드 수↑ → 파드당 native↓
-    단, request 200m에서 baseline 87.5m=44%이므로 target은 ~50% 아래로
-    못 내림(idle이 한가해 보이지 않아 maxReplicas 고정). 이 경우 사이징으로.
+    단, request 200m에서 baseline 87.5m=44%이고 HPA tolerance 10% 고려 시 target은
+    ~49%(target 60% 유지 시엔 request ~160m) 아래로 못 내림(idle이 tolerance 밴드에
+    들어 scale-in 멈춤). 이 경우 사이징으로.
 
 [Q1=누수] (Q2로 위치 특정 후)
   ├ 힙 누수      → 힙덤프 분석, retained 객체 추적. 코드 수정(설정 아님).
